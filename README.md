@@ -265,9 +265,7 @@ The project maintains Architecture Decision Records in `docs/adr/`:
 
 ## License
 
-MIT — see [LICENSE](LICENSE). This software is provided **as-is, with no warranty of any kind**. Use it freely, fork it, build on it. Pull requests to this repository will not be accepted — this is my personal version. If you want to extend or modify it, please fork it.
-
-The vendored 51Folds SDK (`vendor/fiftyone-folds/`) is included for build convenience. It is a client library for the [51Folds](https://51folds.ai) commercial API service — a 51Folds account and API key are required to use it.
+All rights reserved. No license is granted for use, modification, or distribution. The vendored 51Folds SDK (`vendor/fiftyone-folds/`) is a client library for the [51Folds](https://51folds.ai) commercial API service.
 
 ## References
 
