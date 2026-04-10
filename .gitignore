@@ -1,0 +1,22 @@
+# Environment and secrets
+.env
+
+# Build artifacts
+/target/
+
+# Local data
+/data/
+
+# Screenshots / reference images (may contain sensitive UI state)
+/learning-images/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
