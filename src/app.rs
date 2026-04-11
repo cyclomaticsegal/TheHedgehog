@@ -39,6 +39,9 @@ const TEXT_MUTED: Color32 = Color32::from_rgb(74, 85, 104);
 const ALERT_NORMAL_FG: Color32 = Color32::from_rgb(56, 161, 105);
 const ALERT_APPROACHING_FG: Color32 = Color32::from_rgb(214, 158, 46);
 const ALERT_EXTREME_FG: Color32 = Color32::from_rgb(229, 62, 62);
+// Accent colors (51Folds model explorer)
+const ACCENT_BLUE: Color32 = Color32::from_rgb(96, 165, 250);
+const ACCENT_BLUE_DIM: Color32 = Color32::from_rgb(59, 130, 246);
 
 const MAX_LOG_ENTRIES: usize = 500;
 
@@ -49,11 +52,27 @@ enum CentralView {
     Model,
 }
 
-/// Sub-tab within the 51Folds model explorer.
+/// Navigation stack within the 51Folds model explorer. Each variant is
+/// a "page" in the central panel. The back button pops to the previous
+/// level rather than needing explicit tab management.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ModelTab {
+enum ModelView {
+    /// Outcome probabilities + take away summary.
     Outcome,
-    Drivers,
+    /// Clean list of all drivers with pill selectors.
+    DriverList,
+    /// Full-page detail for one driver (by index in draft_drivers).
+    DriverDetail(usize),
+    /// Full-page content for one driver section.
+    DriverSection(usize, DriverDetailSection),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriverDetailSection {
+    WhySelected,
+    WhyMatters,
+    WhatShift,
+    WhatMonitor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -351,9 +370,9 @@ pub struct DashboardApp {
     report_task: LlmTask,
     report_result: Option<String>,
     report_markdown_cache: egui_commonmark::CommonMarkCache,
-    // Central panel view mode
+    // Central panel view mode + navigation stack
     central_view: CentralView,
-    model_tab: ModelTab,
+    model_view: ModelView,
     // 51Folds state (session-only, not persisted)
     parsed_hypothesis: Option<ParsedHypothesis>,
     draft_hypothesis: Option<ParsedHypothesis>,
@@ -379,6 +398,28 @@ impl DashboardApp {
         visuals.faint_bg_color = Color32::from_rgb(20, 28, 45);
         visuals.widgets.noninteractive.bg_fill = SURFACE;
         visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+        // `widgets.noninteractive.fg_stroke.color` is what egui uses as the
+        // default text color (see Visuals::text_color). The dark preset ships
+        // with ~gray(140), which makes egui_commonmark body text render with
+        // very low contrast on our PANEL_BG. Force it to TEXT_PRIMARY so
+        // markdown-rendered content (report window, help, AI analysis) is
+        // legible out of the box, without every label needing `.color(...)`.
+        visuals.widgets.noninteractive.fg_stroke =
+            egui::Stroke::new(1.0, TEXT_PRIMARY);
+        visuals.override_text_color = Some(TEXT_PRIMARY);
+        // `.weak()` text (blockquotes in egui_commonmark, etc.) resolves via
+        // `weak_text_color() = gray_out(text_color())`, which tints towards
+        // `widgets.noninteractive.weak_bg_fill`. The dark preset leaves that
+        // at gray(27) so weak text blends towards near-black — completely
+        // unreadable on our navy background. Point the fade-out target at a
+        // mid-light grey so weak text stays legible (dimmer than primary,
+        // but not invisible).
+        visuals.widgets.noninteractive.weak_bg_fill = TEXT_SECONDARY;
+        // `.strong()` text (bold, headings) resolves via `strong_text_color()`
+        // which reads `widgets.active.fg_stroke.color`. Default dark is
+        // already WHITE — pin it explicitly so nothing can drift it.
+        visuals.widgets.active.fg_stroke =
+            egui::Stroke::new(1.0, Color32::WHITE);
         visuals.widgets.inactive.bg_fill = SURFACE;
         visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
         visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
@@ -387,7 +428,13 @@ impl DashboardApp {
         // blue so selected items are clearly distinct from unselected.
         visuals.selection.bg_fill = Color32::from_rgb(37, 65, 130);
         visuals.selection.stroke = egui::Stroke::new(1.0, TEXT_SECONDARY);
-        _cc.egui_ctx.set_visuals(visuals);
+        // Pin the theme preference to Dark and install our palette under BOTH
+        // theme slots — otherwise a macOS system in Light mode can fall back
+        // to egui's default light visuals mid-session (central panel glitch).
+        _cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        _cc.egui_ctx
+            .set_visuals_of(egui::Theme::Dark, visuals.clone());
+        _cc.egui_ctx.set_visuals_of(egui::Theme::Light, visuals);
 
         let db_path = database_path();
         if let Some(parent) = db_path.parent() {
@@ -484,7 +531,7 @@ impl DashboardApp {
             report_result: None,
             report_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             central_view: CentralView::Charts,
-            model_tab: ModelTab::Outcome,
+            model_view: ModelView::Outcome,
             parsed_hypothesis: None,
             draft_hypothesis: None,
             folds_task: FoldsTask::new(),
@@ -1120,7 +1167,7 @@ impl DashboardApp {
             self.folds_task.load_from_json(&json);
             if self.folds_task.is_complete() {
                 self.central_view = CentralView::Model;
-                self.model_tab = ModelTab::Outcome;
+                self.model_view = ModelView::Outcome;
             }
         }
         self.outcomes_task = LlmTask::new();
@@ -1203,7 +1250,7 @@ impl DashboardApp {
         // Auto-switch to the model view when a build just completed
         if !was_complete && self.folds_task.is_complete() {
             self.central_view = CentralView::Model;
-            self.model_tab = ModelTab::Outcome;
+            self.model_view = ModelView::Outcome;
         }
     }
 
@@ -1276,7 +1323,7 @@ impl DashboardApp {
             let mut msg = format!("Resumed polling for {resumed} pending 51Folds model(s)");
             if suspect > 0 {
                 msg.push_str(&format!(
-                    " — {suspect} suspect (>25 min pending)"
+                    " ({suspect} suspect, >25 min pending)"
                 ));
             }
             if marked_failure > 0 {
@@ -1525,29 +1572,37 @@ impl DashboardApp {
         if self.folds_task.is_complete() {
             let model_id = self.folds_task.model_id.clone().unwrap_or_default();
             ui.label(
-                RichText::new(format!("Model {model_id} — ✓ complete"))
-                    .size(11.0)
+                RichText::new(format!("Model ID: {model_id}   complete"))
+                    .size(13.0)
+                    .strong()
                     .color(ALERT_NORMAL_FG),
             );
-            ui.add_space(4.0);
-            // Brief outcome listing
+            ui.add_space(8.0);
+            // Brief outcome listing — probability on its own line above the
+            // label so wrapped outcome text stays cleanly left-aligned.
             if let Some(ref model) = self.folds_task.model {
                 for o in &model.current.outcomes {
                     ui.label(
-                        RichText::new(format!(
-                            "  {} — {:.1}%",
-                            o.label,
-                            o.probability.unwrap_or(0.0) * 100.0
-                        ))
-                        .size(10.0)
-                        .color(TEXT_SECONDARY),
+                        RichText::new(format!("{:.1}%", o.probability.unwrap_or(0.0) * 100.0))
+                            .size(12.0)
+                            .strong()
+                            .color(TEXT_PRIMARY),
                     );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(&o.label)
+                                .size(12.0)
+                                .color(TEXT_SECONDARY),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(6.0);
                 }
             }
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             if ui.button("View in 51Folds tab").clicked() {
                 self.central_view = CentralView::Model;
-                self.model_tab = ModelTab::Outcome;
+                self.model_view = ModelView::Outcome;
             }
             return;
         }
@@ -1556,7 +1611,7 @@ impl DashboardApp {
         if let Some(ref err) = self.folds_task.error.clone() {
             ui.label(
                 RichText::new(format!("Error: {err}"))
-                    .size(11.0)
+                    .size(12.0)
                     .color(ALERT_EXTREME_FG),
             );
             return;
@@ -1570,13 +1625,13 @@ impl DashboardApp {
             } else if model_id.is_empty() {
                 "Submitting to 51Folds…".to_owned()
             } else {
-                format!("Model {model_id} — building…")
+                format!("Model ID: {model_id}   building…")
             };
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
                     RichText::new(label)
-                        .size(11.0)
+                        .size(12.0)
                         .color(TEXT_SECONDARY),
                 );
             });
@@ -2097,11 +2152,17 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         ui.add_space(6.0);
     }
 
-    /// Render the 51Folds model explorer in the central panel with
-    /// Outcome / Drivers sub-tabs.
+    /// Render the 51Folds model explorer in the central panel.
     fn render_central_model_view(&mut self, ui: &mut egui::Ui) {
         if !self.folds_task.is_complete() {
-            ui.centered_and_justified(|ui| {
+            ui.add_space(80.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new("No model loaded")
+                        .size(18.0)
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(8.0);
                 ui.label(
                     RichText::new("Run an AI analysis and create a 51Folds model to see results here.")
                         .size(14.0)
@@ -2111,55 +2172,66 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             return;
         }
 
-        ui.add_space(8.0);
+        ui.add_space(12.0);
 
-        // Model header
-        let model_id = self.folds_task.model_id.clone().unwrap_or_default();
+        // Question as the primary heading — large, bold, white.
         let question = self
             .folds_task
             .model
             .as_ref()
             .map(|m| m.question.clone())
             .unwrap_or_default();
-        ui.label(
-            RichText::new(format!("Model {model_id}"))
-                .size(13.0)
-                .strong()
-                .color(ALERT_NORMAL_FG),
-        );
         if !question.is_empty() {
-            ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
                     RichText::new(&question)
-                        .size(12.0)
-                        .color(TEXT_SECONDARY),
+                        .size(22.0)
+                        .strong()
+                        .color(Color32::WHITE),
                 )
                 .wrap(),
             );
+            ui.add_space(6.0);
         }
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
+
+        // Timestamps.
+        if let Some(ref model) = self.folds_task.model {
+            ui.label(
+                RichText::new(format!(
+                    "Created {} \u{00B7} Last updated {}",
+                    &model.created_at.get(..16).unwrap_or(&model.created_at),
+                    &model.updated_at.get(..16).unwrap_or(&model.updated_at),
+                ))
+                .size(12.0)
+                .color(TEXT_SECONDARY),
+            );
+        }
+
+        ui.add_space(18.0);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                match self.model_tab {
-                    ModelTab::Outcome => {
+                match self.model_view {
+                    ModelView::Outcome => {
                         self.render_central_outcome_tab(ui);
                     }
-                    ModelTab::Drivers => {
+                    ModelView::DriverList => {
                         self.render_central_drivers_tab(ui);
+                    }
+                    ModelView::DriverDetail(idx) => {
+                        self.render_driver_detail_page(ui, idx);
+                    }
+                    ModelView::DriverSection(idx, section) => {
+                        self.render_driver_section_page(ui, idx, section);
                     }
                 }
             });
     }
 
-    /// Outcome sub-tab: probability bars + take away summary.
+    /// Outcome view: probability bars + take away, rendered as dark
+    /// cards with high-contrast typography.
     fn render_central_outcome_tab(&mut self, ui: &mut egui::Ui) {
-        let row_width = ui.available_width().min(800.0);
-
         let outcomes: Vec<(String, f64)> = self
             .folds_task
             .model
@@ -2174,55 +2246,98 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             .unwrap_or_default();
         let previous = self.folds_task.previous_outcomes.clone();
 
-        for (label, prob) in &outcomes {
-            // Outcome label — bright white for readability
+        // ── Outcomes card ────────────────────────────────────────────
+        section_card(ui, |ui| {
             ui.label(
-                RichText::new(label)
-                    .size(13.0)
+                RichText::new("OUTCOME PROBABILITIES")
+                    .size(12.0)
                     .strong()
-                    .color(Color32::WHITE),
+                    .color(TEXT_SECONDARY),
             );
-            ui.add_space(2.0);
+            ui.add_space(14.0);
 
-            // Probability bar
-            let bar_height = 28.0;
-            let desired = Vec2::new(row_width, bar_height);
-            let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
-            let painter = ui.painter();
+            let bar_max_width = 260.0_f32;
+            let pct_width = 80.0_f32;
+            let label_width =
+                (ui.available_width() - bar_max_width - pct_width - 24.0).max(180.0);
 
-            painter.rect_filled(rect, 4.0, SURFACE);
+            for (i, (label, prob)) in outcomes.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    // Left-aligned label — `allocate_ui_with_layout` pins the
+                    // column width while keeping text flush-left (add_sized
+                    // centers its content, which is wrong for a list of
+                    // outcomes).
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(label_width, 28.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(label)
+                                        .size(16.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .wrap(),
+                            );
+                        },
+                    );
 
-            let bar_width = (*prob as f32 * rect.width()).max(0.0);
-            let fill_rect = Rect::from_min_size(rect.min, Vec2::new(bar_width, bar_height));
-            let bar_color = Color32::from_rgb(59, 130, 246);
-            painter.rect_filled(fill_rect, 4.0, bar_color);
+                    // Dark track + blue fill bar (high contrast on dark bg).
+                    let desired = Vec2::new(bar_max_width, 14.0);
+                    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 4.0, Color32::from_rgb(31, 41, 55));
+                    let fill_width = (*prob as f32 * bar_max_width).max(2.0);
+                    let fill_rect = Rect::from_min_size(rect.min, Vec2::new(fill_width, 14.0));
+                    painter.rect_filled(fill_rect, 4.0, ACCENT_BLUE);
 
-            painter.text(
-                Pos2::new(rect.right() - 8.0, rect.center().y),
-                Align2::RIGHT_CENTER,
-                format!("{:.1}%", prob * 100.0),
-                FontId::proportional(13.0),
-                Color32::WHITE,
-            );
+                    // Percentage — right-aligned within a fixed column.
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(pct_width, 28.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                RichText::new(format!("{:.1}%", prob * 100.0))
+                                    .size(16.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                        },
+                    );
+                });
 
-            // Before/after delta annotation
-            if let Some(ref prev) = previous {
-                if let Some((_, prev_prob)) = prev.iter().find(|(l, _)| l == label) {
-                    let delta = prob - prev_prob;
-                    if delta.abs() > 0.001 {
-                        let (text, color) = if delta > 0.0 {
-                            (format!("Previously: {:.2}% ↑", prev_prob * 100.0), ALERT_NORMAL_FG)
-                        } else {
-                            (format!("Previously: {:.2}% ↓", prev_prob * 100.0), ALERT_EXTREME_FG)
-                        };
-                        ui.label(RichText::new(text).size(10.0).color(color));
+                // Delta annotation (after re-evaluate).
+                if let Some(ref prev) = previous {
+                    if let Some((_, prev_prob)) = prev.iter().find(|(l, _)| l == label) {
+                        let delta = prob - prev_prob;
+                        if delta.abs() > 0.001 {
+                            let (text, color) = if delta > 0.0 {
+                                (
+                                    format!("  \u{2191} up from {:.1}%", prev_prob * 100.0),
+                                    ALERT_NORMAL_FG,
+                                )
+                            } else {
+                                (
+                                    format!("  \u{2193} down from {:.1}%", prev_prob * 100.0),
+                                    ALERT_EXTREME_FG,
+                                )
+                            };
+                            ui.horizontal(|ui| {
+                                ui.add_space(label_width);
+                                ui.label(RichText::new(text).size(12.0).color(color));
+                            });
+                        }
                     }
                 }
-            }
-            ui.add_space(8.0);
-        }
 
-        // Take Away summary
+                if i + 1 < outcomes.len() {
+                    ui.add_space(12.0);
+                }
+            }
+        });
+
+        // ── Take-away card ───────────────────────────────────────────
         let summary = self
             .folds_task
             .model
@@ -2230,256 +2345,137 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             .map(|m| m.short_summary.clone())
             .unwrap_or_default();
         if !summary.is_empty() {
-            ui.add_space(12.0);
-            ui.label(
-                RichText::new("Take Away")
-                    .size(13.0)
-                    .strong()
-                    .color(TEXT_SECONDARY),
-            );
-            ui.add_space(6.0);
-            let block_indent: f32 = 8.0;
-            let frame_inner_h_margin: f32 = 12.0;
-            let inner_text_width = (row_width - block_indent * 2.0 - frame_inner_h_margin * 2.0).max(60.0);
-            ui.horizontal(|ui| {
-                ui.add_space(block_indent);
-                egui::Frame::default()
-                    .fill(SURFACE)
-                    .corner_radius(4.0)
-                    .inner_margin(egui::Margin::symmetric(frame_inner_h_margin as i8, 10))
-                    .show(ui, |ui| {
-                        ui.set_min_width(inner_text_width);
-                        ui.set_max_width(inner_text_width);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&summary)
-                                    .size(13.0)
-                                    .color(TEXT_PRIMARY),
-                            )
-                            .wrap(),
-                        );
-                    });
+            ui.add_space(16.0);
+            section_card(ui, |ui| {
+                ui.label(
+                    RichText::new("TAKE AWAY")
+                        .size(12.0)
+                        .strong()
+                        .color(TEXT_SECONDARY),
+                );
+                ui.add_space(10.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&summary)
+                            .size(15.0)
+                            .color(TEXT_PRIMARY),
+                    )
+                    .wrap(),
+                );
             });
         }
+
+        // ── Call-to-action ───────────────────────────────────────────
+        ui.add_space(22.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Want to fine-tune the drivers to see how the prediction changes?",
+                )
+                .size(14.0)
+                .color(TEXT_SECONDARY),
+            )
+            .wrap(),
+        );
+        ui.add_space(12.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().button_padding = Vec2::new(16.0, 10.0);
+            if ui
+                .add(
+                    egui::Button::new(
+                        RichText::new("Show me the drivers  \u{276F}")
+                            .size(14.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    )
+                    .fill(ACCENT_BLUE_DIM)
+                    .corner_radius(6.0),
+                )
+                .clicked()
+            {
+                self.model_view = ModelView::DriverList;
+            }
+        });
     }
 
-    /// Drivers sub-tab: driver list with state selectors, expandable
-    /// details, and re-evaluate / reset buttons.
+    /// Driver list: each driver in its own dark card with name,
+    /// pill selector, and navigation chevron.
     fn render_central_drivers_tab(&mut self, ui: &mut egui::Ui) {
-        let driver_count = self.folds_task.draft_drivers.len();
-        ui.label(
-            RichText::new(format!("Drivers ({driver_count})"))
-                .size(13.0)
-                .strong()
-                .color(TEXT_SECONDARY),
-        );
-        ui.add_space(6.0);
-
-        // Pre-fetch context and justification data to avoid borrow conflicts
-        let driver_contexts: Vec<Option<fiftyone_folds::DriverContext>> = self
-            .folds_task
-            .model
-            .as_ref()
-            .map(|m| {
-                self.folds_task
-                    .draft_drivers
-                    .iter()
-                    .map(|d| {
-                        m.drivers
-                            .iter()
-                            .find(|def| def.code == d.code)
-                            .and_then(|def| def.context.clone())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let driver_justifications: Vec<Option<fiftyone_folds::DriverJustification>> = self
-            .folds_task
-            .model
-            .as_ref()
-            .map(|m| {
-                self.folds_task
-                    .draft_drivers
-                    .iter()
-                    .map(|d| {
-                        m.current
-                            .drivers
-                            .iter()
-                            .find(|ds| ds.code == d.code)
-                            .and_then(|ds| ds.justification.clone())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut navigate_to: Option<usize> = None;
 
         for (i, draft) in self.folds_task.draft_drivers.iter_mut().enumerate() {
             let is_modified = draft.selected_state != draft.original_state;
+            let name_color = if is_modified {
+                ALERT_APPROACHING_FG
+            } else {
+                Color32::WHITE
+            };
 
-            egui::Frame::default()
-                .fill(SURFACE)
-                .corner_radius(4.0)
-                .inner_margin(egui::Margin::symmetric(10, 8))
-                .show(ui, |ui| {
-                    // Header: expand chevron + driver name + code badge
-                    ui.horizontal(|ui| {
-                        let icon = if draft.expanded { "▼" } else { "▶" };
-                        if ui.small_button(icon).clicked() {
-                            draft.expanded = !draft.expanded;
-                        }
-                        let name_color = if is_modified { ALERT_APPROACHING_FG } else { TEXT_PRIMARY };
-                        ui.label(
-                            RichText::new(&draft.name)
-                                .size(12.0)
+            section_card(ui, |ui| {
+                // Top row: driver name (left) + chevron (right).
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("{} ({})", &draft.name, &draft.code))
+                                .size(17.0)
                                 .strong()
                                 .color(name_color),
-                        );
-                        ui.label(
-                            RichText::new(format!("({})", draft.code))
-                                .size(10.0)
-                                .color(TEXT_MUTED),
-                        );
-                    });
-                    ui.add_space(2.0);
-
-                    // Segmented state selector
-                    ui.horizontal_wrapped(|ui| {
-                        for (state_name, _desc) in &draft.state_options {
-                            let selected = *state_name == draft.selected_state;
-                            let text = RichText::new(state_name).size(11.0);
-                            let btn = if selected {
-                                egui::Button::new(text.color(Color32::WHITE))
-                                    .fill(Color32::from_rgb(59, 130, 246))
-                            } else {
-                                egui::Button::new(text.color(TEXT_SECONDARY))
-                                    .fill(SURFACE_HOVER)
-                            };
-                            if ui.add(btn).clicked() {
-                                draft.selected_state = state_name.clone();
-                            }
-                        }
-                    });
-
-                    // Expandable details
-                    if draft.expanded {
-                        ui.add_space(6.0);
-
-                        // State descriptors
-                        ui.label(
-                            RichText::new("State descriptions")
-                                .size(11.0)
-                                .strong()
-                                .color(TEXT_SECONDARY),
-                        );
-                        for (sn, sd) in &draft.state_options {
-                            let highlight = *sn == draft.selected_state;
-                            let color = if highlight { TEXT_PRIMARY } else { TEXT_MUTED };
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(format!("  {sn}: {sd}"))
-                                        .size(11.0)
-                                        .color(color),
+                        )
+                        .wrap(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().button_padding = Vec2::new(12.0, 7.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Details  \u{276F}")
+                                        .size(13.0)
+                                        .color(ACCENT_BLUE),
                                 )
-                                .wrap(),
-                            );
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::new(1.0, BORDER))
+                                .corner_radius(6.0),
+                            )
+                            .clicked()
+                        {
+                            navigate_to = Some(i);
                         }
+                    });
+                });
 
-                        // Justification
-                        if let Some(Some(just)) = driver_justifications.get(i) {
-                            if !just.content.is_empty() {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Why was {} selected?",
-                                        draft.original_state
-                                    ))
-                                    .size(11.0)
-                                    .strong()
-                                    .color(TEXT_SECONDARY),
-                                );
-                                for line in &just.content {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(line)
-                                                .size(11.0)
-                                                .color(TEXT_SECONDARY),
-                                        )
-                                        .wrap(),
-                                    );
-                                }
-                                if !just.citations.is_empty() {
-                                    ui.add_space(2.0);
-                                    for cite in &just.citations {
-                                        ui.label(
-                                            RichText::new(format!("[{}] {}", cite.num, cite.source))
-                                                .size(10.0)
-                                                .color(TEXT_MUTED),
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                ui.add_space(12.0);
 
-                        // Context sections
-                        if let Some(Some(ctx)) = driver_contexts.get(i) {
-                            if !ctx.importance.is_empty() {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new("Why does this matter?")
-                                        .size(11.0)
-                                        .strong()
-                                        .color(TEXT_SECONDARY),
-                                );
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&ctx.importance)
-                                            .size(11.0)
-                                            .color(TEXT_SECONDARY),
-                                    )
-                                    .wrap(),
-                                );
-                            }
-                            if !ctx.shifts.is_empty() {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new("What could shift?")
-                                        .size(11.0)
-                                        .strong()
-                                        .color(TEXT_SECONDARY),
-                                );
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&ctx.shifts)
-                                            .size(11.0)
-                                            .color(TEXT_SECONDARY),
-                                    )
-                                    .wrap(),
-                                );
-                            }
-                            if !ctx.monitor.is_empty() {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new("What should we monitor?")
-                                        .size(11.0)
-                                        .strong()
-                                        .color(TEXT_SECONDARY),
-                                );
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&ctx.monitor)
-                                            .size(11.0)
-                                            .color(TEXT_SECONDARY),
-                                    )
-                                    .wrap(),
-                                );
-                            }
+                // Pill selector row — generous padding so labels breathe.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().button_padding = Vec2::new(14.0, 8.0);
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for (state_name, _desc) in &draft.state_options {
+                        let selected = *state_name == draft.selected_state;
+                        let text = RichText::new(state_name).size(13.0).strong();
+                        let btn = if selected {
+                            egui::Button::new(text.color(Color32::WHITE))
+                                .fill(ACCENT_BLUE_DIM)
+                                .stroke(egui::Stroke::new(1.0, ACCENT_BLUE))
+                                .corner_radius(16.0)
+                                .min_size(Vec2::new(0.0, 30.0))
+                        } else {
+                            egui::Button::new(text.color(TEXT_SECONDARY))
+                                .fill(PANEL_BG)
+                                .stroke(egui::Stroke::new(1.0, BORDER))
+                                .corner_radius(16.0)
+                                .min_size(Vec2::new(0.0, 30.0))
+                        };
+                        if ui.add(btn).clicked() {
+                            draft.selected_state = state_name.clone();
                         }
                     }
                 });
-            ui.add_space(4.0);
+            });
+
+            ui.add_space(10.0);
         }
 
-        // Re-evaluate & Reset buttons
+        // ── Re-evaluate / Reset bar ────────────────────────────────
         ui.add_space(8.0);
         let any_modified = self
             .folds_task
@@ -2490,14 +2486,35 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         let mut reset_clicked = false;
 
         ui.horizontal(|ui| {
-            let btn = ui.add_enabled(any_modified, egui::Button::new("Re-evaluate"));
-            if btn.clicked() {
-                reevaluate_clicked = true;
-            }
-            ui.add_space(8.0);
-            let reset_btn = ui.add_enabled(any_modified, egui::Button::new("Reset"));
+            ui.spacing_mut().button_padding = Vec2::new(16.0, 9.0);
+            let reset_btn = ui.add_enabled(
+                any_modified,
+                egui::Button::new(
+                    RichText::new("Reset")
+                        .size(14.0)
+                        .color(if any_modified { TEXT_PRIMARY } else { TEXT_MUTED }),
+                )
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(6.0),
+            );
             if reset_btn.clicked() {
                 reset_clicked = true;
+            }
+            ui.add_space(12.0);
+            let reeval_btn = ui.add_enabled(
+                any_modified,
+                egui::Button::new(
+                    RichText::new("Re-evaluate")
+                        .size(14.0)
+                        .strong()
+                        .color(if any_modified { Color32::WHITE } else { TEXT_MUTED }),
+                )
+                .fill(if any_modified { ACCENT_BLUE_DIM } else { SURFACE })
+                .corner_radius(6.0),
+            );
+            if reeval_btn.clicked() {
+                reevaluate_clicked = true;
             }
         });
 
@@ -2509,6 +2526,365 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         }
         if reevaluate_clicked {
             self.start_folds_reevaluate();
+        }
+
+        // Navigate after releasing borrows
+        if let Some(idx) = navigate_to {
+            self.model_view = ModelView::DriverDetail(idx);
+        }
+    }
+
+    /// Full-page driver detail — state descriptions and navigable
+    /// "Related" section, all rendered as dark cards.
+    fn render_driver_detail_page(&mut self, ui: &mut egui::Ui, idx: usize) {
+        if back_button(ui, "Drivers").clicked() {
+            self.model_view = ModelView::DriverList;
+            return;
+        }
+        ui.add_space(12.0);
+
+        let Some(draft) = self.folds_task.draft_drivers.get(idx) else {
+            self.model_view = ModelView::DriverList;
+            return;
+        };
+
+        // Driver name heading.
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} ({})", &draft.name, &draft.code))
+                    .size(22.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .wrap(),
+        );
+        ui.add_space(14.0);
+
+        // Current state card — prominent, highlighted.
+        let current_desc = draft
+            .state_options
+            .iter()
+            .find(|(name, _)| *name == draft.selected_state)
+            .map(|(_, desc)| desc.as_str())
+            .unwrap_or("");
+        section_card(ui, |ui| {
+            ui.label(
+                RichText::new("CURRENT STATE")
+                    .size(12.0)
+                    .strong()
+                    .color(TEXT_SECONDARY),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(&draft.selected_state)
+                    .size(17.0)
+                    .strong()
+                    .color(ACCENT_BLUE),
+            );
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(current_desc)
+                        .size(14.0)
+                        .color(TEXT_PRIMARY),
+                )
+                .wrap(),
+            );
+        });
+
+        // All state descriptions card.
+        ui.add_space(14.0);
+        section_card(ui, |ui| {
+            ui.label(
+                RichText::new("ALL STATES")
+                    .size(12.0)
+                    .strong()
+                    .color(TEXT_SECONDARY),
+            );
+            ui.add_space(12.0);
+            for (state_idx, (name, desc)) in draft.state_options.iter().enumerate() {
+                let is_current = *name == draft.selected_state;
+                let name_color = if is_current { ACCENT_BLUE } else { Color32::WHITE };
+                let body_color = if is_current { TEXT_PRIMARY } else { TEXT_SECONDARY };
+                ui.label(
+                    RichText::new(name)
+                        .size(14.0)
+                        .strong()
+                        .color(name_color),
+                );
+                ui.add_space(3.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(desc).size(13.0).color(body_color),
+                    )
+                    .wrap(),
+                );
+                if state_idx + 1 < draft.state_options.len() {
+                    ui.add_space(12.0);
+                }
+            }
+        });
+
+        // Related navigable rows.
+        ui.add_space(18.0);
+        ui.label(
+            RichText::new("RELATED")
+                .size(12.0)
+                .strong()
+                .color(TEXT_SECONDARY),
+        );
+        ui.add_space(10.0);
+
+        let sections = [
+            (
+                DriverDetailSection::WhySelected,
+                format!("Why was {} selected?", &draft.original_state),
+            ),
+            (DriverDetailSection::WhyMatters, "Why does this matter?".to_owned()),
+            (DriverDetailSection::WhatShift, "What could shift?".to_owned()),
+            (DriverDetailSection::WhatMonitor, "What should we monitor?".to_owned()),
+        ];
+
+        for (section, label) in &sections {
+            let mut clicked = false;
+            section_card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(label)
+                                .size(15.0)
+                                .color(Color32::WHITE),
+                        )
+                        .wrap(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("\u{276F}").size(15.0).color(ACCENT_BLUE),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(egui::Stroke::NONE),
+                            )
+                            .clicked()
+                        {
+                            clicked = true;
+                        }
+                    });
+                });
+            });
+            if clicked {
+                self.model_view = ModelView::DriverSection(idx, *section);
+            }
+            ui.add_space(10.0);
+        }
+    }
+
+    /// Full-page content for a single driver section (justification,
+    /// importance, shifts, or monitoring). Reached by clicking a Related
+    /// row on the driver detail page.
+    fn render_driver_section_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        section: DriverDetailSection,
+    ) {
+        let original_state = self
+            .folds_task
+            .draft_drivers
+            .get(idx)
+            .map(|d| d.original_state.clone())
+            .unwrap_or_default();
+        let driver_code = self
+            .folds_task
+            .draft_drivers
+            .get(idx)
+            .map(|d| d.code.clone())
+            .unwrap_or_default();
+
+        // Back button — use the driver code (always short) instead of the
+        // full name, so wide driver titles don't get truncated here.
+        let back_label = if driver_code.is_empty() {
+            "Driver".to_owned()
+        } else {
+            format!("Driver ({driver_code})")
+        };
+        if back_button(ui, &back_label).clicked() {
+            self.model_view = ModelView::DriverDetail(idx);
+            return;
+        }
+        ui.add_space(12.0);
+
+        // Section heading
+        let heading = match section {
+            DriverDetailSection::WhySelected => format!("Why was {} selected?", original_state),
+            DriverDetailSection::WhyMatters => "Why does this matter?".to_owned(),
+            DriverDetailSection::WhatShift => "What could shift?".to_owned(),
+            DriverDetailSection::WhatMonitor => "What should we monitor?".to_owned(),
+        };
+        ui.add(
+            egui::Label::new(
+                RichText::new(&heading)
+                    .size(22.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            )
+            .wrap(),
+        );
+        ui.add_space(16.0);
+
+        // Content — fetch from model data
+        match section {
+            DriverDetailSection::WhySelected => {
+                // Justification from current.drivers[].justification
+                let justification = self
+                    .folds_task
+                    .model
+                    .as_ref()
+                    .and_then(|m| {
+                        m.current
+                            .drivers
+                            .iter()
+                            .find(|ds| ds.code == driver_code)
+                            .and_then(|ds| ds.justification.clone())
+                    });
+
+                if let Some(just) = justification {
+                    section_card(ui, |ui| {
+                        for (para_idx, para) in just.content.iter().enumerate() {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(para)
+                                        .size(15.0)
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .wrap(),
+                            );
+                            if para_idx + 1 < just.content.len() {
+                                ui.add_space(12.0);
+                            }
+                        }
+                    });
+
+                    if !just.citations.is_empty() {
+                        ui.add_space(16.0);
+                        ui.label(
+                            RichText::new("SOURCES")
+                                .size(12.0)
+                                .strong()
+                                .color(TEXT_SECONDARY),
+                        );
+                        ui.add_space(8.0);
+                        section_card(ui, |ui| {
+                            for (cite_idx, cite) in just.citations.iter().enumerate() {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("[{}] {}", cite.num, cite.source))
+                                            .size(13.0)
+                                            .color(TEXT_SECONDARY),
+                                    )
+                                    .wrap(),
+                                );
+                                if cite_idx + 1 < just.citations.len() {
+                                    ui.add_space(6.0);
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("No justification data available for this driver.")
+                            .size(14.0)
+                            .color(TEXT_MUTED),
+                    );
+                }
+            }
+
+            DriverDetailSection::WhyMatters => {
+                self.render_driver_context_section(ui, &driver_code, |ctx| &ctx.importance);
+            }
+
+            DriverDetailSection::WhatShift => {
+                self.render_driver_context_section(ui, &driver_code, |ctx| &ctx.shifts);
+            }
+
+            DriverDetailSection::WhatMonitor => {
+                self.render_driver_context_section(ui, &driver_code, |ctx| &ctx.monitor);
+            }
+        }
+    }
+
+    /// Render a driver context section (importance, shifts, or monitor)
+    /// with proper paragraph rendering for markdown-like content.
+    fn render_driver_context_section(
+        &self,
+        ui: &mut egui::Ui,
+        driver_code: &str,
+        field: fn(&fiftyone_folds::DriverContext) -> &str,
+    ) {
+        let context = self
+            .folds_task
+            .model
+            .as_ref()
+            .and_then(|m| {
+                m.drivers
+                    .iter()
+                    .find(|def| def.code == driver_code)
+                    .and_then(|def| def.context.as_ref())
+            });
+
+        if let Some(ctx) = context {
+            let content = field(ctx);
+            if content.is_empty() {
+                ui.label(
+                    RichText::new("No data available for this section.")
+                        .size(14.0)
+                        .color(TEXT_MUTED),
+                );
+                return;
+            }
+
+            section_card(ui, |ui| {
+                // Split on double newlines for paragraph breaks, render
+                // bold headers (lines starting with **) differently.
+                let paragraphs: Vec<&str> = content
+                    .split("\n\n")
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                for (p_idx, trimmed) in paragraphs.iter().enumerate() {
+                    if trimmed.starts_with("**")
+                        && (trimmed.contains("**\n") || trimmed.ends_with("**"))
+                    {
+                        let clean = trimmed.trim_matches('*').trim();
+                        ui.label(
+                            RichText::new(clean)
+                                .size(15.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.add_space(8.0);
+                    } else {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(*trimmed)
+                                    .size(15.0)
+                                    .color(TEXT_PRIMARY),
+                            )
+                            .wrap(),
+                        );
+                        if p_idx + 1 < paragraphs.len() {
+                            ui.add_space(12.0);
+                        }
+                    }
+                }
+            });
+        } else {
+            ui.label(
+                RichText::new("No context data available for this driver.")
+                    .size(14.0)
+                    .color(TEXT_MUTED),
+            );
         }
     }
 
@@ -2694,10 +3070,10 @@ impl DashboardApp {
                     }
                 }
 
-                // Model sub-tabs (only when 51Folds tab is active)
+                // Model navigation (only when 51Folds tab is active)
                 if self.central_view == CentralView::Model {
-                    ui.selectable_value(&mut self.model_tab, ModelTab::Outcome, "Outcome");
-                    ui.selectable_value(&mut self.model_tab, ModelTab::Drivers, "Drivers");
+                    ui.selectable_value(&mut self.model_view, ModelView::Outcome, "Outcome");
+                    ui.selectable_value(&mut self.model_view, ModelView::DriverList, "Drivers");
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3030,7 +3406,14 @@ impl DashboardApp {
             });
 
         // -- Central panel --
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // Pin an explicit dark Frame here so the central area can never
+        // fall back to a light system theme. This is especially important
+        // for the 51Folds model tabs, which otherwise rendered white text
+        // on a near-white background on macOS Light mode.
+        let central_frame = egui::Frame::default()
+            .fill(PANEL_BG)
+            .inner_margin(egui::Margin::symmetric(16, 12));
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             match self.central_view {
                 CentralView::Charts => {
                     let has_any_data = !self.series(Instrument::Vix).is_empty();
@@ -3224,6 +3607,16 @@ impl DashboardApp {
                         });
                     } else if let Some(ref report) = self.report_result {
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            // Belt-and-suspenders: re-assert readable text
+                            // colors for the markdown viewer in case anything
+                            // upstream mutated visuals for this frame.
+                            let v = ui.visuals_mut();
+                            v.override_text_color = Some(TEXT_PRIMARY);
+                            v.widgets.noninteractive.fg_stroke =
+                                egui::Stroke::new(1.0, TEXT_PRIMARY);
+                            v.widgets.noninteractive.weak_bg_fill = TEXT_SECONDARY;
+                            v.widgets.active.fg_stroke =
+                                egui::Stroke::new(1.0, Color32::WHITE);
                             egui_commonmark::CommonMarkViewer::new()
                                 .show(ui, &mut self.report_markdown_cache, report);
                         });
@@ -3248,19 +3641,20 @@ impl DashboardApp {
                                     let label = inference_label(inf);
                                     let resp = ui.horizontal(|ui| {
                                         let (dot_rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(8.0, 8.0),
+                                            Vec2::new(10.0, 10.0),
                                             Sense::hover(),
                                         );
                                         ui.painter().circle_filled(
                                             dot_rect.center(),
-                                            4.0,
+                                            5.0,
                                             level_color,
                                         );
+                                        ui.add_space(4.0);
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(label)
-                                                    .size(11.0)
-                                                    .color(APP_BG),
+                                                    .size(13.0)
+                                                    .color(TEXT_PRIMARY),
                                             )
                                             .sense(Sense::click()),
                                         )
@@ -3547,6 +3941,34 @@ fn sidebar_threshold_controls(ui: &mut egui::Ui, settings: &mut AppSettings) {
 // ---------------------------------------------------------------------------
 // Central panel widgets
 // ---------------------------------------------------------------------------
+
+/// Back-navigation button used in the 51Folds model explorer detail pages.
+fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(format!("\u{276E}  {label}"))
+                .size(14.0)
+                .color(ACCENT_BLUE),
+        )
+        .fill(Color32::TRANSPARENT)
+        .stroke(egui::Stroke::NONE),
+    )
+}
+
+/// Dark surface card used throughout the 51Folds model explorer — groups
+/// related content with a visible border on the panel background.
+fn section_card<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    egui::Frame::default()
+        .fill(SURFACE)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(18, 16))
+        .show(ui, add_contents)
+        .inner
+}
 
 fn empty_state_panel(ui: &mut egui::Ui, refreshing: bool) {
     ui.add_space(80.0);
@@ -4570,7 +4992,7 @@ fn inference_label_short(inf: &SavedInference) -> String {
     let vix = inf
         .vix_close
         .map(|v| format!("VIX {v:.1}"))
-        .unwrap_or_else(|| "—".to_owned());
+        .unwrap_or_else(|| "n/a".to_owned());
 
     let overlay = inf
         .overlay_instruments
