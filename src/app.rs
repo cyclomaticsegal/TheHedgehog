@@ -187,6 +187,12 @@ struct FoldsTask {
     previous_outcomes: Option<Vec<(String, f64)>>,
     /// True when a driver re-evaluate (not initial creation) is in flight.
     reevaluating: bool,
+    /// True while a Refresh-Model call is in flight. Separate from
+    /// `in_flight` so the Refresh affordance can run concurrently with
+    /// (or after) a re-eval without clobbering its state.
+    refresh_in_flight: bool,
+    refresh_rx: Option<Receiver<FoldsResult>>,
+    refresh_error: Option<String>,
 }
 
 impl FoldsTask {
@@ -200,6 +206,9 @@ impl FoldsTask {
             draft_drivers: Vec::new(),
             previous_outcomes: None,
             reevaluating: false,
+            refresh_in_flight: false,
+            refresh_rx: None,
+            refresh_error: None,
         }
     }
 
@@ -212,6 +221,9 @@ impl FoldsTask {
         self.draft_drivers.clear();
         self.previous_outcomes = None;
         self.reevaluating = false;
+        self.refresh_in_flight = false;
+        self.refresh_rx = None;
+        self.refresh_error = None;
     }
 
     fn start(&mut self, rx: Receiver<FoldsResult>) {
@@ -229,23 +241,72 @@ impl FoldsTask {
             .drivers
             .iter()
             .map(|def| {
-                let current_state = model
+                // Raw current state from the model response (this is
+                // what the server considers authoritative).
+                let raw_current_state = model
                     .current
                     .drivers
                     .iter()
                     .find(|ds| ds.code == def.code)
                     .map(|ds| ds.state.clone())
                     .unwrap_or_default();
+
                 let state_options: Vec<(String, String)> = def
                     .state_descriptors
                     .iter()
                     .map(|sd| (sd.name.clone(), sd.description.clone()))
                     .collect();
+
+                // Normalize the current state to match the case/
+                // whitespace of the corresponding state_descriptor
+                // name. Two layers of defence:
+                //
+                // 1. **Case-insensitive name match** — handles the
+                //    trivial case where the server returned "high"
+                //    while descriptors contain "High".
+                //
+                // 2. **Ordinal fallback via the canonical Bayesian
+                //    schema states** `[Negligible, Low, Medium, High,
+                //    Extreme]`. The 51Folds LLM-generated
+                //    `stateDescriptors[].name` sometimes uses
+                //    "Negligent" (a real word but the wrong one) in
+                //    place of the schema's canonical "Negligible".
+                //    When the server returns `current.drivers[].state
+                //    = "Negligible"` we can't find "Negligible" in
+                //    `["Negligent", "Low", …]` by name, but both
+                //    arrays have the same ordinal layout, so we look
+                //    up the canonical state's index and use the
+                //    descriptor at the same index. Without this step
+                //    a driver whose server-canonical state is
+                //    "Negligible" would leave `original_state` un-
+                //    matchable against any pill and every re-eval
+                //    would accidentally flag it as dirty.
+                const CANONICAL_STATES: &[&str] =
+                    &["Negligible", "Low", "Medium", "High", "Extreme"];
+                let by_name = state_options
+                    .iter()
+                    .map(|(name, _)| name)
+                    .find(|name| name.eq_ignore_ascii_case(&raw_current_state))
+                    .cloned();
+                let normalized_current = by_name.unwrap_or_else(|| {
+                    if let Some(canonical_idx) = CANONICAL_STATES
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(&raw_current_state))
+                    {
+                        if let Some((descriptor_name, _)) =
+                            state_options.get(canonical_idx)
+                        {
+                            return descriptor_name.clone();
+                        }
+                    }
+                    raw_current_state
+                });
+
                 DraftDriverState {
                     code: def.code.clone(),
                     name: def.name.clone(),
-                    selected_state: current_state.clone(),
-                    original_state: current_state,
+                    selected_state: normalized_current.clone(),
+                    original_state: normalized_current,
                     state_options,
                     expanded: false,
                 }
@@ -261,6 +322,13 @@ impl FoldsTask {
     }
 
     fn poll(&mut self) {
+        self.poll_main();
+        self.poll_refresh();
+    }
+
+    /// Poll the main channel — used by create_and_poll and
+    /// patch_drivers. Handles build/completion/reeval results.
+    fn poll_main(&mut self) {
         let Some(rx) = self.rx.take() else { return };
         loop {
             match rx.try_recv() {
@@ -281,6 +349,11 @@ impl FoldsTask {
                     self.reevaluating = false;
                     return;
                 }
+                // These variants never arrive on the main channel —
+                // they come in via refresh_rx. Ignore them here to
+                // keep poll_main exhaustive but simple.
+                Ok(FoldsResult::Refreshed(_))
+                | Ok(FoldsResult::RefreshFailed(_)) => {}
                 Err(TryRecvError::Empty) => {
                     self.rx = Some(rx);
                     return;
@@ -296,11 +369,64 @@ impl FoldsTask {
         }
     }
 
+    /// Poll the refresh channel — used by the Refresh Model button.
+    fn poll_refresh(&mut self) {
+        let Some(rx) = self.refresh_rx.take() else { return };
+        loop {
+            match rx.try_recv() {
+                Ok(FoldsResult::Refreshed(model)) => {
+                    self.model_id = Some(model.model_id.clone());
+                    self.model = Some(model);
+                    self.refresh_in_flight = false;
+                    self.refresh_error = None;
+                    self.init_draft_drivers();
+                    // Refresh replaces in-memory state with server
+                    // state, but does NOT create a history entry —
+                    // rehydration isn't a distinct user action.
+                    return;
+                }
+                Ok(FoldsResult::RefreshFailed(e)) => {
+                    self.refresh_in_flight = false;
+                    self.refresh_error = Some(e);
+                    return;
+                }
+                Ok(_) => {} // other variants ignored on this channel
+                Err(TryRecvError::Empty) => {
+                    self.refresh_rx = Some(rx);
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.refresh_in_flight = false;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Load a completed model response from a JSON blob (e.g. from the
-    /// database). On success, initializes draft drivers and marks as complete.
+    /// database). On success, initializes draft drivers and pushes an
+    /// "Original" snapshot onto the session history. If the blob is a
+    /// stub (empty outcomes / empty drivers from earlier buggy writes),
+    /// keeps the `model_id` so the UI can still offer Refresh, but
+    /// leaves `model` as `None`.
     fn load_from_json(&mut self, json: &str) {
         match serde_json::from_str::<fiftyone_folds::ModelResponse>(json) {
             Ok(model) => {
+                let is_stub =
+                    model.current.outcomes.is_empty() || model.drivers.is_empty();
+                if is_stub {
+                    eprintln!(
+                        "[folds] load_from_json: stub detected for model_id={:?} \
+                         — keeping model_id for recovery, leaving model=None",
+                        model.model_id,
+                    );
+                    if !model.model_id.is_empty() {
+                        self.model_id = Some(model.model_id);
+                    }
+                    self.model = None;
+                    self.draft_drivers.clear();
+                    return;
+                }
                 self.model_id = Some(model.model_id.clone());
                 self.model = Some(Box::new(model));
                 self.init_draft_drivers();
@@ -384,6 +510,266 @@ pub struct DashboardApp {
     /// the current draft hypothesis). Independent from `ai_task` so it does
     /// not save to the inference history or touch the main analysis state.
     outcomes_task: LlmTask,
+    /// Startup splash screen state — overlays the dashboard until the
+    /// auto-dismiss timer elapses or the user clicks/presses a key.
+    splash: SplashState,
+    /// Shared mascot texture — decoded once from the embedded PNG and
+    /// kept alive for the lifetime of the app. Used by both the startup
+    /// splash and the Help window header.
+    mascot_texture: Option<egui::TextureHandle>,
+    /// When set, the Outcome tab renders a fading success toast
+    /// announcing that probabilities were just updated from driver
+    /// edits. Cleared once `now() >= reeval_toast_until`.
+    reeval_toast_until: Option<std::time::Instant>,
+    /// If set, a modal confirmation is asking the user to approve
+    /// reverting to the original (from the DB baseline).
+    revert_to_original_confirm: bool,
+}
+
+/// Mascot PNG embedded at compile time (transparent background — chosen
+/// so the character's dark navy outlines blend into our PANEL_BG instead
+/// of sitting inside a jarring white rectangle).
+const MASCOT_PNG: &[u8] =
+    include_bytes!("../artwork/hedgehog-mascot-transparent.png");
+
+/// Startup-splash overlay state. The actual mascot texture lives on
+/// `DashboardApp::mascot_texture` so it can be shared with the Help
+/// window; this struct only tracks the display timer and whether the
+/// splash observed the startup auto-refresh.
+struct SplashState {
+    /// When the splash became visible. `None` once dismissed.
+    shown_at: Option<std::time::Instant>,
+    /// First frame we observed `refresh_in_flight == true` while the
+    /// splash was visible. Used to detect "loading mode" and to know
+    /// whether we need the post-load extension.
+    loading_start: Option<std::time::Instant>,
+    /// First frame after `loading_start` at which `refresh_in_flight`
+    /// flipped back to `false`. Used to record that we've already
+    /// applied the post-load hold extension so it doesn't re-trigger.
+    loading_end: Option<std::time::Instant>,
+}
+
+impl SplashState {
+    fn new() -> Self {
+        Self {
+            shown_at: Some(std::time::Instant::now()),
+            loading_start: None,
+            loading_end: None,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.shown_at.is_some()
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.shown_at
+            .map(|t| t.elapsed())
+            .unwrap_or_default()
+    }
+
+    fn dismiss(&mut self) {
+        self.shown_at = None;
+    }
+}
+
+/// Render the compact header at the top of the Help window — mascot on
+/// the left, app name / tagline / version chip stacked on the right,
+/// followed by a thin separator. Kept as a free function (not a
+/// `&mut self` method) so it can be called from inside the
+/// `egui::Window::open(&mut self.show_help)` closure without colliding
+/// with that outer mutable borrow.
+fn render_help_header(
+    ui: &mut egui::Ui,
+    mascot: Option<&egui::TextureHandle>,
+) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if let Some(tex) = mascot {
+            let orig = tex.size_vec2();
+            let target_h = 96.0;
+            let scale = target_h / orig.y;
+            let size = orig * scale;
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                tex.id(),
+                size,
+            )));
+        } else {
+            ui.add_space(96.0);
+        }
+
+        ui.add_space(18.0);
+
+        ui.vertical(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("The Hedgehog")
+                    .size(28.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(2.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Regime-shift monitoring for commodities and risk assets",
+                    )
+                    .size(13.0)
+                    .color(TEXT_SECONDARY),
+                )
+                .wrap(),
+            );
+            ui.add_space(6.0);
+            let _ = ui.add(
+                egui::Button::new(
+                    RichText::new("PREVIEW 0.1")
+                        .size(10.0)
+                        .strong()
+                        .color(ACCENT_BLUE),
+                )
+                .fill(PANEL_BG)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(10.0)
+                .min_size(Vec2::new(0.0, 20.0)),
+            );
+        });
+    });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+}
+
+/// Decode the embedded mascot PNG and upload it as an egui texture. Only
+/// called once, the first frame the splash is active. Returns `None` if
+/// decoding fails — the splash will then render text-only (which is
+/// acceptable; we shouldn't crash startup over a missing mascot).
+fn load_mascot_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(MASCOT_PNG).ok()?;
+    let mut rgba = img.to_rgba8();
+    // The "transparent" PNG actually has its editor's grey-and-white
+    // checker pattern baked in as opaque pixels instead of real alpha.
+    // Flood-fill it out before uploading so the mascot sits cleanly on
+    // the splash card's dark SURFACE.
+    strip_checker_background(&mut rgba);
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.as_flat_samples();
+    let color_image =
+        egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+    Some(ctx.load_texture(
+        "hedgehog-mascot",
+        color_image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// Rewrite the alpha channel of an RGBA image so that the editor's
+/// transparency-checker pattern becomes truly transparent. Works in two
+/// passes:
+///
+/// 1. **Flood-fill from every edge pixel** — any pixel that looks like
+///    checker background (light and near-neutral grey) and is connected
+///    to the image border gets alpha 0. The mascot's dark navy outline
+///    is the natural stopping boundary for the fill, so interior whites
+///    (face, belly, gloves) are preserved.
+///
+/// 2. **Edge-feather pass** — any pixel still opaque but adjacent to a
+///    newly-transparent pixel has its alpha reduced if it's lightish.
+///    This softens the anti-aliased band where the mascot's outline
+///    originally blended with the checker, eliminating a visible halo.
+fn strip_checker_background(rgba: &mut image::RgbaImage) {
+    use std::collections::VecDeque;
+
+    let (w, h) = rgba.dimensions();
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let idx_of = |x: u32, y: u32| (y * w + x) as usize;
+    let mut visited = vec![false; (w * h) as usize];
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+
+    // Seed from the entire 4-pixel border.
+    for x in 0..w {
+        queue.push_back((x, 0));
+        queue.push_back((x, h - 1));
+    }
+    for y in 0..h {
+        queue.push_back((0, y));
+        queue.push_back((w - 1, y));
+    }
+
+    // Pass 1: connected-component flood fill from the border.
+    while let Some((x, y)) = queue.pop_front() {
+        let i = idx_of(x, y);
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+
+        let [r, g, b, _] = rgba.get_pixel(x, y).0;
+        if !is_checker_pixel(r, g, b) {
+            continue;
+        }
+        rgba.put_pixel(x, y, image::Rgba([r, g, b, 0]));
+
+        if x > 0 {
+            queue.push_back((x - 1, y));
+        }
+        if x + 1 < w {
+            queue.push_back((x + 1, y));
+        }
+        if y > 0 {
+            queue.push_back((x, y - 1));
+        }
+        if y + 1 < h {
+            queue.push_back((x, y + 1));
+        }
+    }
+
+    // Pass 2: feather anti-aliased edge pixels. Snapshot the pass-1 state
+    // so reads see original pixels, writes go to the live buffer.
+    let snapshot = rgba.clone();
+    for y in 0..h {
+        for x in 0..w {
+            let p = snapshot.get_pixel(x, y);
+            if p.0[3] == 0 {
+                continue;
+            }
+            // Count 4-connected transparent neighbours.
+            let has_transparent_neighbor = (x > 0
+                && snapshot.get_pixel(x - 1, y).0[3] == 0)
+                || (x + 1 < w && snapshot.get_pixel(x + 1, y).0[3] == 0)
+                || (y > 0 && snapshot.get_pixel(x, y - 1).0[3] == 0)
+                || (y + 1 < h && snapshot.get_pixel(x, y + 1).0[3] == 0);
+            if !has_transparent_neighbor {
+                continue;
+            }
+            let [r, g, b, _] = p.0;
+            let avg = (r as u16 + g as u16 + b as u16) / 3;
+            // Very light edge pixel — almost certainly residual checker.
+            if avg > 210 {
+                rgba.put_pixel(x, y, image::Rgba([r, g, b, 0]));
+            } else if avg > 170 {
+                // Mid-tone edge pixel — reduce alpha to soften the outline.
+                let t = (avg - 170) as f32 / 40.0;
+                let new_alpha = ((1.0 - t) * 255.0) as u8;
+                rgba.put_pixel(x, y, image::Rgba([r, g, b, new_alpha]));
+            }
+        }
+    }
+}
+
+/// A pixel is "checker background" if it is both light and close to
+/// neutral grey — ie. one of the two checker tiles (#FFF or ~#CCC) or a
+/// lightly anti-aliased pixel between them.
+fn is_checker_pixel(r: u8, g: u8, b: u8) -> bool {
+    let avg = (r as u16 + g as u16 + b as u16) / 3;
+    if avg < 170 {
+        return false;
+    }
+    let max_c = r.max(g).max(b);
+    let min_c = r.min(g).min(b);
+    (max_c - min_c) < 30
 }
 
 impl DashboardApp {
@@ -537,6 +923,10 @@ impl DashboardApp {
             folds_task: FoldsTask::new(),
             last_inference_id: None,
             outcomes_task: LlmTask::new(),
+            splash: SplashState::new(),
+            mascot_texture: None,
+            reeval_toast_until: None,
+            revert_to_original_confirm: false,
         };
 
         // Skip data loading and auto-refresh if the database couldn't be opened;
@@ -1165,9 +1555,26 @@ impl DashboardApp {
         self.folds_task.reset();
         if let Ok(Some(json)) = self.storage.load_folds_response_for_inference(inf.id) {
             self.folds_task.load_from_json(&json);
-            if self.folds_task.is_complete() {
+            // Navigate to the 51Folds tab whenever the inference has a
+            // linked model, even if the stored JSON turned out to be a
+            // stub. The central panel will render either the Outcome
+            // view (complete model) or the "Model data is incomplete"
+            // recovery screen (stubbed model) — both are better than
+            // silently staying on the Charts view.
+            if self.folds_task.model_id.is_some() {
                 self.central_view = CentralView::Model;
                 self.model_view = ModelView::Outcome;
+            }
+            // Stubbed model + API key available → kick off an
+            // automatic refresh so the model self-heals from the
+            // server without the user having to click Refresh. The
+            // recovery screen will show the in-flight spinner and
+            // swap in the real data as soon as GET returns.
+            if !self.folds_task.is_complete()
+                && self.folds_task.model_id.is_some()
+                && !self.api_keys.folds.trim().is_empty()
+            {
+                self.start_folds_refresh();
             }
         }
         self.outcomes_task = LlmTask::new();
@@ -1212,16 +1619,18 @@ impl DashboardApp {
         let Some(ref model) = self.folds_task.model else { return };
         let model_id = model.model_id.clone();
 
-        // Snapshot current outcomes for before/after comparison
+        // Snapshot current outcomes for before/after comparison (only
+        // set after we've confirmed we're actually going to hit the
+        // API — otherwise a bailed-out attempt would clobber the
+        // deltas from a previous successful re-eval).
         let current_outcomes: Vec<(String, f64)> = model
             .current
             .outcomes
             .iter()
             .map(|o| (o.label.clone(), o.probability.unwrap_or(0.0)))
             .collect();
-        self.folds_task.previous_outcomes = Some(current_outcomes);
 
-        // Build driver state inputs from modified drafts only
+        // Build driver state inputs from modified drafts only.
         let changed: Vec<fiftyone_folds::DriverStateInput> = self
             .folds_task
             .draft_drivers
@@ -1232,6 +1641,39 @@ impl DashboardApp {
                 state: d.selected_state.clone(),
             })
             .collect();
+
+        eprintln!(
+            "[folds] reeval: model_id={} changed_drivers={}",
+            model_id,
+            changed.len()
+        );
+
+        // Client-side safety net. If the filter produced no diffs we
+        // must NOT hit the API — the 51Folds server rejects empty
+        // payloads with "Validation failed: No driver states were
+        // changed", which ends up in the user's face as a confusing
+        // error even though the real issue is that the UI thought
+        // something was dirty but the filter disagreed. Bail out with
+        // a clear in-app message instead.
+        if changed.is_empty() {
+            eprintln!(
+                "[folds] aborting re-eval: no driver state diffs after filtering \
+                 (check for case/whitespace mismatch between state_descriptors \
+                 and current.drivers[].state)"
+            );
+            self.folds_task.error = Some(
+                "No driver changes to re-evaluate. Click a different state on at least one driver before clicking Re-evaluate.".to_owned(),
+            );
+            self.set_status(
+                "Re-evaluate ignored: no driver changes detected.",
+                StatusKind::Error,
+            );
+            return;
+        }
+
+        // Commit the previous-outcomes snapshot only now that we know
+        // we're actually sending a request.
+        self.folds_task.previous_outcomes = Some(current_outcomes);
 
         let (tx, rx) = mpsc::channel();
         self.folds_task.rx = Some(rx);
@@ -1244,13 +1686,158 @@ impl DashboardApp {
         });
     }
 
+    /// Kick off a Refresh-Model background call. Re-fetches the full
+    /// `ModelResponse` from the server and persists it, so the local
+    /// view matches the authoritative server state. User-triggered via
+    /// the Refresh button in the 51Folds sidebar summary.
+    fn start_folds_refresh(&mut self) {
+        let api_key = self.api_keys.folds.trim().to_owned();
+        if api_key.is_empty() {
+            self.folds_task.refresh_error =
+                Some("No 51Folds API key set.".to_owned());
+            return;
+        }
+        let Some(ref model_id) = self.folds_task.model_id.clone() else {
+            self.folds_task.refresh_error =
+                Some("No model loaded to refresh.".to_owned());
+            return;
+        };
+        // Prevent a second refresh on top of one that's still running.
+        if self.folds_task.refresh_in_flight {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.folds_task.refresh_rx = Some(rx);
+        self.folds_task.refresh_in_flight = true;
+        self.folds_task.refresh_error = None;
+
+        let db_path = database_path();
+        let model_id = model_id.clone();
+        thread::spawn(move || {
+            crate::folds::refresh_model(api_key, model_id, db_path, tx);
+        });
+    }
+
+    /// Revert-to-original: read the immutable DB baseline for the
+    /// current model, extract its driver states, and PATCH the server
+    /// with them. The server re-infers from the pristine input and
+    /// returns outcomes matching the build-time snapshot.
+    fn start_folds_revert_to_original(&mut self) {
+        let Some(inf_id) = self.last_inference_id else {
+            self.folds_task.error =
+                Some("Can't find the original — no inference linked to this model.".to_owned());
+            return;
+        };
+        let baseline_json = match self.storage.load_folds_response_for_inference(inf_id) {
+            Ok(Some(json)) => json,
+            Ok(None) => {
+                self.folds_task.error = Some(
+                    "No baseline snapshot stored locally for this model."
+                        .to_owned(),
+                );
+                return;
+            }
+            Err(e) => {
+                self.folds_task.error =
+                    Some(format!("Couldn't read baseline: {e}"));
+                return;
+            }
+        };
+        let baseline: fiftyone_folds::ModelResponse =
+            match serde_json::from_str(&baseline_json) {
+                Ok(m) => m,
+                Err(e) => {
+                    self.folds_task.error =
+                        Some(format!("Stored baseline is unreadable: {e}"));
+                    return;
+                }
+            };
+        if baseline.current.drivers.is_empty() {
+            self.folds_task.error = Some(
+                "Stored baseline has no driver data. Try building a new model."
+                    .to_owned(),
+            );
+            return;
+        }
+
+        let api_key = self.api_keys.folds.trim().to_owned();
+        if api_key.is_empty() {
+            self.folds_task.error = Some("No 51Folds API key set.".to_owned());
+            return;
+        }
+        let Some(model_id) = self.folds_task.model_id.clone() else {
+            return;
+        };
+
+        // Snapshot current outcomes for deltas.
+        let current_outcomes: Vec<(String, f64)> = self
+            .folds_task
+            .model
+            .as_ref()
+            .map(|m| {
+                m.current
+                    .outcomes
+                    .iter()
+                    .map(|o| (o.label.clone(), o.probability.unwrap_or(0.0)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.folds_task.previous_outcomes = Some(current_outcomes);
+
+        let drivers: Vec<fiftyone_folds::DriverStateInput> = baseline
+            .current
+            .drivers
+            .iter()
+            .map(|d| fiftyone_folds::DriverStateInput {
+                code: d.code.clone(),
+                state: d.state.clone(),
+            })
+            .collect();
+
+        let (tx, rx) = mpsc::channel();
+        self.folds_task.rx = Some(rx);
+        self.folds_task.reevaluating = true;
+        self.folds_task.in_flight = true;
+        self.folds_task.error = None;
+
+        // Revert uses PUT (update_drivers) rather than PATCH so the
+        // server atomically replaces all driver states in one shot.
+        // PATCH is partial-merge and has been observed to leave the
+        // post-revert inference subtly different from the pristine
+        // original; PUT eliminates that drift.
+        thread::spawn(move || {
+            crate::folds::put_drivers(api_key, model_id, drivers, tx);
+        });
+    }
+
     fn poll_folds(&mut self) {
         let was_complete = self.folds_task.is_complete();
+        let was_reevaluating = self.folds_task.reevaluating;
         self.folds_task.poll();
-        // Auto-switch to the model view when a build just completed
+
+        // Auto-switch to the model view when the initial build just
+        // completed.
         if !was_complete && self.folds_task.is_complete() {
             self.central_view = CentralView::Model;
             self.model_view = ModelView::Outcome;
+        }
+
+        // Re-evaluate just finished successfully — auto-navigate to
+        // the Outcome tab so the user sees the updated probabilities.
+        if was_reevaluating
+            && !self.folds_task.reevaluating
+            && self.folds_task.error.is_none()
+        {
+            self.central_view = CentralView::Model;
+            self.model_view = ModelView::Outcome;
+            self.reeval_toast_until = Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(5000),
+            );
+            self.set_status(
+                "51Folds model re-evaluated with your driver edits.",
+                StatusKind::Success,
+            );
         }
     }
 
@@ -1604,6 +2191,44 @@ impl DashboardApp {
                 self.central_view = CentralView::Model;
                 self.model_view = ModelView::Outcome;
             }
+
+            // ── Refresh affordance ─────────────────────────────────
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let label = if self.folds_task.refresh_in_flight {
+                    "Refreshing…"
+                } else {
+                    "Refresh"
+                };
+                let btn = ui.add_enabled(
+                    !self.folds_task.refresh_in_flight,
+                    egui::Button::new(
+                        RichText::new(label).size(11.0).color(TEXT_SECONDARY),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .corner_radius(4.0),
+                );
+                if btn.on_hover_text(
+                    "Pull the latest model state from 51Folds and refresh the local copy."
+                ).clicked() {
+                    self.start_folds_refresh();
+                }
+                if self.folds_task.refresh_in_flight {
+                    ui.spinner();
+                }
+            });
+            if let Some(ref err) = self.folds_task.refresh_error.clone() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("Couldn't refresh: {err}"))
+                            .size(10.0)
+                            .color(ALERT_EXTREME_FG),
+                    )
+                    .wrap(),
+                );
+            }
+
             return;
         }
 
@@ -2155,24 +2780,119 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
     /// Render the 51Folds model explorer in the central panel.
     fn render_central_model_view(&mut self, ui: &mut egui::Ui) {
         if !self.folds_task.is_complete() {
+            // Two empty states: genuinely no model loaded, or we have
+            // a `model_id` in memory but the model itself is stub /
+            // unloadable. The second case is a recovery scenario —
+            // show a Refresh button so the user can pull a fresh copy
+            // from the server without needing to rebuild.
+            let recoverable_id =
+                self.folds_task.model_id.clone().filter(|s| !s.is_empty());
             ui.add_space(80.0);
             ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new("No model loaded")
-                        .size(18.0)
-                        .color(TEXT_MUTED),
-                );
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("Run an AI analysis and create a 51Folds model to see results here.")
-                        .size(14.0)
-                        .color(TEXT_MUTED),
-                );
+                if let Some(id) = recoverable_id {
+                    if self.folds_task.refresh_in_flight {
+                        // Auto-refresh is running — show a clear "fetching"
+                        // state so the user knows the app isn't stuck.
+                        ui.spinner();
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new("Reloading model from 51Folds…")
+                                .size(16.0)
+                                .color(Color32::WHITE),
+                        );
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Pulling the latest state for model {id}.",
+                                ))
+                                .size(13.0)
+                                .color(TEXT_SECONDARY),
+                            )
+                            .wrap(),
+                        );
+                        ui.ctx().request_repaint_after(
+                            std::time::Duration::from_millis(100),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("Model data is incomplete")
+                                .size(18.0)
+                                .color(ALERT_APPROACHING_FG),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "Model {id} is tracked locally but the stored copy looks corrupt. Pull a fresh copy from 51Folds to recover.",
+                                ))
+                                .size(13.0)
+                                .color(TEXT_SECONDARY),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(14.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Reload model from 51Folds")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(ACCENT_BLUE_DIM)
+                                .corner_radius(6.0),
+                            )
+                            .clicked()
+                        {
+                            self.start_folds_refresh();
+                        }
+                        if let Some(err) = self.folds_task.refresh_error.clone() {
+                            ui.add_space(10.0);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("Couldn't refresh: {err}"))
+                                        .size(11.0)
+                                        .color(ALERT_EXTREME_FG),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("No model loaded")
+                            .size(18.0)
+                            .color(TEXT_MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Run an AI analysis and create a 51Folds model to see results here.")
+                            .size(14.0)
+                            .color(TEXT_MUTED),
+                    );
+                }
             });
             return;
         }
 
         ui.add_space(12.0);
+
+        // ── Re-evaluation status & error banners ───────────────────
+        // Rendered above the question so they're the first thing the
+        // user sees regardless of which sub-view they're on. The
+        // reevaluating banner is the primary "system is working" cue;
+        // the error banner is the retry cue on failure.
+        if self.folds_task.reevaluating {
+            render_reeval_in_flight_banner(ui);
+            // Keep the spinner animation alive.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(80));
+            ui.add_space(14.0);
+        } else if let Some(ref err) = self.folds_task.error.clone() {
+            render_reeval_error_banner(ui, err);
+            ui.add_space(14.0);
+        }
 
         // Question as the primary heading — large, bold, white.
         let question = self
@@ -2194,16 +2914,58 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             ui.add_space(6.0);
         }
 
-        // Timestamps.
-        if let Some(ref model) = self.folds_task.model {
-            ui.label(
-                RichText::new(format!(
-                    "Created {} \u{00B7} Last updated {}",
-                    &model.created_at.get(..16).unwrap_or(&model.created_at),
-                    &model.updated_at.get(..16).unwrap_or(&model.updated_at),
-                ))
-                .size(12.0)
-                .color(TEXT_SECONDARY),
+        // Timestamps + Refresh-from-server affordance, on one row so
+        // the user can always see when the model was last updated and
+        // pull a fresh copy without hunting for buttons in other panels.
+        ui.horizontal(|ui| {
+            if let Some(ref model) = self.folds_task.model {
+                ui.label(
+                    RichText::new(format!(
+                        "Created {} \u{00B7} Last updated {}",
+                        &model.created_at.get(..16).unwrap_or(&model.created_at),
+                        &model.updated_at.get(..16).unwrap_or(&model.updated_at),
+                    ))
+                    .size(12.0)
+                    .color(TEXT_SECONDARY),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.folds_task.refresh_in_flight {
+                    "Refreshing…"
+                } else {
+                    "\u{21BB} Refresh from 51Folds"
+                };
+                let resp = ui.add_enabled(
+                    !self.folds_task.refresh_in_flight && !self.folds_task.reevaluating,
+                    egui::Button::new(
+                        RichText::new(label).size(11.0).color(ACCENT_BLUE),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .corner_radius(4.0),
+                );
+                if resp
+                    .on_hover_text(
+                        "Pull the latest model state from 51Folds and overwrite the local copy. Use this if the pills don't match what the server has.",
+                    )
+                    .clicked()
+                {
+                    self.start_folds_refresh();
+                }
+                if self.folds_task.refresh_in_flight {
+                    ui.spinner();
+                }
+            });
+        });
+
+        if let Some(ref err) = self.folds_task.refresh_error.clone() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("Couldn't refresh: {err}"))
+                        .size(11.0)
+                        .color(ALERT_EXTREME_FG),
+                )
+                .wrap(),
             );
         }
 
@@ -2232,6 +2994,34 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
     /// Outcome view: probability bars + take away, rendered as dark
     /// cards with high-contrast typography.
     fn render_central_outcome_tab(&mut self, ui: &mut egui::Ui) {
+        // ── Success toast (if a re-eval just completed) ────────────
+        // Fades over the last 800 ms of its display window. Clickable
+        // to dismiss early. Auto-clears once expired.
+        if let Some(until) = self.reeval_toast_until {
+            let now = std::time::Instant::now();
+            if now >= until {
+                self.reeval_toast_until = None;
+            } else {
+                const FADE_OUT_WINDOW_MS: u128 = 800;
+                let remaining = until.saturating_duration_since(now).as_millis();
+                let fade_out = if remaining < FADE_OUT_WINDOW_MS {
+                    1.0 - (remaining as f32 / FADE_OUT_WINDOW_MS as f32)
+                } else {
+                    0.0
+                };
+                render_reeval_success_toast(ui, fade_out);
+                // Click-to-dismiss: any pointer click while the toast
+                // is visible jumps straight to the end of its window.
+                if ui.ctx().input(|i| i.pointer.any_click()) {
+                    self.reeval_toast_until = None;
+                }
+                // Keep repainting so the fade animates.
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(32));
+                ui.add_space(14.0);
+            }
+        }
+
         let outcomes: Vec<(String, f64)> = self
             .folds_task
             .model
@@ -2256,77 +3046,125 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             );
             ui.add_space(14.0);
 
+            // Layout constants. Every row is painted by hand into a
+            // single full-width allocated rect — no nested horizontal
+            // layouts, no column-width arithmetic. This is the only way
+            // to guarantee that the percentage text lands exactly at
+            // the card's inner right edge regardless of how egui's
+            // `available_width` resolves for a wrapping label column.
             let bar_max_width = 260.0_f32;
-            let pct_width = 80.0_f32;
-            let label_width =
-                (ui.available_width() - bar_max_width - pct_width - 24.0).max(180.0);
+            let pct_width = 62.0_f32;
+            let bar_to_pct_gap = 12.0_f32;
+            let label_to_bar_gap = 16.0_f32;
+            // Track colour — visibly lighter than the card's SURFACE
+            // so the unfilled portion reads as "here's how much further
+            // this bar could go" instead of blending into the card
+            // background. Was `rgb(31,41,55)`, which was barely
+            // distinguishable from `SURFACE rgb(26,34,54)`.
+            let track_color = Color32::from_rgb(55, 67, 92);
+            let font = FontId::new(16.0, egui::FontFamily::Proportional);
 
             for (i, (label, prob)) in outcomes.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    // Left-aligned label — `allocate_ui_with_layout` pins the
-                    // column width while keeping text flush-left (add_sized
-                    // centers its content, which is wrong for a list of
-                    // outcomes).
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(label_width, 28.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(label)
-                                        .size(16.0)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .wrap(),
-                            );
-                        },
-                    );
+                let avail_w = ui.available_width();
+                let label_max_w = (avail_w
+                    - pct_width
+                    - bar_to_pct_gap
+                    - bar_max_width
+                    - label_to_bar_gap)
+                    .max(120.0);
 
-                    // Dark track + blue fill bar (high contrast on dark bg).
-                    let desired = Vec2::new(bar_max_width, 14.0);
-                    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
-                    let painter = ui.painter();
-                    painter.rect_filled(rect, 4.0, Color32::from_rgb(31, 41, 55));
-                    let fill_width = (*prob as f32 * bar_max_width).max(2.0);
-                    let fill_rect = Rect::from_min_size(rect.min, Vec2::new(fill_width, 14.0));
-                    painter.rect_filled(fill_rect, 4.0, ACCENT_BLUE);
-
-                    // Percentage — right-aligned within a fixed column.
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(pct_width, 28.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                RichText::new(format!("{:.1}%", prob * 100.0))
-                                    .size(16.0)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            );
-                        },
-                    );
+                // Pre-layout the label galley so we know how tall the
+                // row needs to be (wrapped labels take two lines).
+                let label_galley = ui.fonts(|f| {
+                    f.layout(
+                        label.clone(),
+                        font.clone(),
+                        Color32::WHITE,
+                        label_max_w,
+                    )
                 });
+                let row_height = label_galley.size().y.max(28.0);
 
-                // Delta annotation (after re-evaluate).
+                // Allocate the full row in one shot. `row_rect.right()`
+                // is guaranteed to be the section_card's inner right
+                // edge — that's what the outer `ui.available_width()`
+                // call resolves to — so everything we anchor from it
+                // lines up to the same pixel across rows.
+                let (row_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(avail_w, row_height), Sense::hover());
+
+                // ── Child positions, right-anchored ────────────
+                // Everything is computed from the card's inner right
+                // edge (`row_rect.right()`). `pct_width` reserves room
+                // for the widest possible percentage ("100.0%") so the
+                // bar's right edge sits cleanly left of the digits
+                // with `bar_to_pct_gap` of breathing room.
+                let pct_right = row_rect.right();
+                let bar_right = pct_right - pct_width - bar_to_pct_gap;
+                let bar_left = bar_right - bar_max_width;
+                let bar_y_center = row_rect.center().y;
+                let bar_top = bar_y_center - 7.0;
+
+                // Label at the left edge, vertically centered in the row.
+                let label_y = bar_y_center - label_galley.size().y / 2.0;
+                ui.painter().galley(
+                    Pos2::new(row_rect.left(), label_y),
+                    label_galley,
+                    Color32::WHITE,
+                );
+
+                // Bar track.
+                let bar_rect = Rect::from_min_size(
+                    Pos2::new(bar_left, bar_top),
+                    Vec2::new(bar_max_width, 14.0),
+                );
+                ui.painter().rect_filled(bar_rect, 5.0, track_color);
+
+                // Bar fill — right-anchored so the bar grows leftward
+                // from the percentage, matching the label on the
+                // opposite side for symmetry.
+                let fill_width = (*prob as f32 * bar_max_width).max(2.0);
+                let fill_rect = Rect::from_min_size(
+                    Pos2::new(bar_right - fill_width, bar_top),
+                    Vec2::new(fill_width, 14.0),
+                );
+                ui.painter().rect_filled(fill_rect, 5.0, ACCENT_BLUE);
+
+                // Percentage painted with an explicit right-center
+                // anchor at the card's inner right edge.
+                ui.painter().text(
+                    Pos2::new(pct_right, bar_y_center),
+                    Align2::RIGHT_CENTER,
+                    format!("{:.1}%", prob * 100.0),
+                    font.clone(),
+                    Color32::WHITE,
+                );
+
+                // Delta annotation (after re-evaluate) — rendered as a
+                // separate row directly below, aligned under the label.
                 if let Some(ref prev) = previous {
                     if let Some((_, prev_prob)) = prev.iter().find(|(l, _)| l == label) {
                         let delta = prob - prev_prob;
                         if delta.abs() > 0.001 {
                             let (text, color) = if delta > 0.0 {
                                 (
-                                    format!("  \u{2191} up from {:.1}%", prev_prob * 100.0),
+                                    format!(
+                                        "\u{2191} up from {:.1}%",
+                                        prev_prob * 100.0
+                                    ),
                                     ALERT_NORMAL_FG,
                                 )
                             } else {
                                 (
-                                    format!("  \u{2193} down from {:.1}%", prev_prob * 100.0),
+                                    format!(
+                                        "\u{2193} down from {:.1}%",
+                                        prev_prob * 100.0
+                                    ),
                                     ALERT_EXTREME_FG,
                                 )
                             };
-                            ui.horizontal(|ui| {
-                                ui.add_space(label_width);
-                                ui.label(RichText::new(text).size(12.0).color(color));
-                            });
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(text).size(12.0).color(color));
                         }
                     }
                 }
@@ -2401,6 +3239,10 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
     /// Driver list: each driver in its own dark card with name,
     /// pill selector, and navigation chevron.
     fn render_central_drivers_tab(&mut self, ui: &mut egui::Ui) {
+        // Snapshot the re-eval flag up-front so we can disable inputs
+        // for the whole view without racing with `start_folds_reevaluate`
+        // (which flips the flag synchronously on button click).
+        let reevaluating = self.folds_task.reevaluating;
         let mut navigate_to: Option<usize> = None;
 
         for (i, draft) in self.folds_task.draft_drivers.iter_mut().enumerate() {
@@ -2446,29 +3288,34 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                 ui.add_space(12.0);
 
                 // Pill selector row — generous padding so labels breathe.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().button_padding = Vec2::new(14.0, 8.0);
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    for (state_name, _desc) in &draft.state_options {
-                        let selected = *state_name == draft.selected_state;
-                        let text = RichText::new(state_name).size(13.0).strong();
-                        let btn = if selected {
-                            egui::Button::new(text.color(Color32::WHITE))
-                                .fill(ACCENT_BLUE_DIM)
-                                .stroke(egui::Stroke::new(1.0, ACCENT_BLUE))
-                                .corner_radius(16.0)
-                                .min_size(Vec2::new(0.0, 30.0))
-                        } else {
-                            egui::Button::new(text.color(TEXT_SECONDARY))
-                                .fill(PANEL_BG)
-                                .stroke(egui::Stroke::new(1.0, BORDER))
-                                .corner_radius(16.0)
-                                .min_size(Vec2::new(0.0, 30.0))
-                        };
-                        if ui.add(btn).clicked() {
-                            draft.selected_state = state_name.clone();
+                // During a re-eval the entire row is disabled so the
+                // user can't race the server with more edits (Nielsen
+                // heuristic #5, error prevention).
+                ui.add_enabled_ui(!reevaluating, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().button_padding = Vec2::new(14.0, 8.0);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for (state_name, _desc) in &draft.state_options {
+                            let selected = *state_name == draft.selected_state;
+                            let text = RichText::new(state_name).size(13.0).strong();
+                            let btn = if selected {
+                                egui::Button::new(text.color(Color32::WHITE))
+                                    .fill(ACCENT_BLUE_DIM)
+                                    .stroke(egui::Stroke::new(1.0, ACCENT_BLUE))
+                                    .corner_radius(16.0)
+                                    .min_size(Vec2::new(0.0, 30.0))
+                            } else {
+                                egui::Button::new(text.color(TEXT_SECONDARY))
+                                    .fill(PANEL_BG)
+                                    .stroke(egui::Stroke::new(1.0, BORDER))
+                                    .corner_radius(16.0)
+                                    .min_size(Vec2::new(0.0, 30.0))
+                            };
+                            if ui.add(btn).clicked() {
+                                draft.selected_state = state_name.clone();
+                            }
                         }
-                    }
+                    });
                 });
             });
 
@@ -2485,14 +3332,33 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         let mut reevaluate_clicked = false;
         let mut reset_clicked = false;
 
+        // Both buttons are locked while a re-eval is in flight. The
+        // Re-evaluate button additionally swaps its label + spinner and
+        // stays in its "working" visual regardless of any_modified, so
+        // the user cannot edit pills back to un-modify it and make the
+        // button appear to "deactivate" while work is still happening.
+        let reset_enabled = any_modified && !reevaluating;
+        let reeval_enabled = any_modified && !reevaluating;
+        // Revert-to-original is always available when a model is
+        // loaded and no re-eval is currently running. It doesn't
+        // require pending pill edits — it's a full "go back to the
+        // initial state" action, distinct from Reset (which only
+        // undoes unsaved pill edits). Implemented by applying
+        // revision 1 (the first/oldest entry) from the server's
+        // revision history.
+        let revert_enabled = !reevaluating
+            && self.folds_task.model.is_some()
+            && !self.folds_task.refresh_in_flight;
+        let mut revert_clicked = false;
+
         ui.horizontal(|ui| {
             ui.spacing_mut().button_padding = Vec2::new(16.0, 9.0);
             let reset_btn = ui.add_enabled(
-                any_modified,
+                reset_enabled,
                 egui::Button::new(
                     RichText::new("Reset")
                         .size(14.0)
-                        .color(if any_modified { TEXT_PRIMARY } else { TEXT_MUTED }),
+                        .color(if reset_enabled { TEXT_PRIMARY } else { TEXT_MUTED }),
                 )
                 .fill(SURFACE)
                 .stroke(egui::Stroke::new(1.0, BORDER))
@@ -2501,20 +3367,63 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             if reset_btn.clicked() {
                 reset_clicked = true;
             }
-            ui.add_space(12.0);
-            let reeval_btn = ui.add_enabled(
-                any_modified,
+            ui.add_space(10.0);
+
+            let revert_btn = ui.add_enabled(
+                revert_enabled,
                 egui::Button::new(
-                    RichText::new("Re-evaluate")
+                    RichText::new("Revert to original")
                         .size(14.0)
-                        .strong()
-                        .color(if any_modified { Color32::WHITE } else { TEXT_MUTED }),
+                        .color(if revert_enabled { TEXT_PRIMARY } else { TEXT_MUTED }),
                 )
-                .fill(if any_modified { ACCENT_BLUE_DIM } else { SURFACE })
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
                 .corner_radius(6.0),
             );
-            if reeval_btn.clicked() {
-                reevaluate_clicked = true;
+            if revert_btn
+                .on_hover_text(
+                    "Undo every change and send the drivers back to the model's initial state.",
+                )
+                .clicked()
+            {
+                revert_clicked = true;
+            }
+            ui.add_space(12.0);
+
+            if reevaluating {
+                // In-flight state: disabled, with a spinner + label.
+                // Wrapped in a dummy add_enabled_ui(false) so the
+                // button's colours pick up egui's disabled styling for
+                // free, and we get a consistent "locked" look.
+                ui.add_enabled_ui(false, |ui| {
+                    ui.add(
+                        egui::Button::new(
+                            RichText::new("\u{27F3}  Re-evaluating\u{2026}")
+                                .size(14.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(ACCENT_BLUE_DIM)
+                        .corner_radius(6.0),
+                    );
+                });
+                ui.add_space(4.0);
+                ui.spinner();
+            } else {
+                let reeval_btn = ui.add_enabled(
+                    reeval_enabled,
+                    egui::Button::new(
+                        RichText::new("Re-evaluate")
+                            .size(14.0)
+                            .strong()
+                            .color(if reeval_enabled { Color32::WHITE } else { TEXT_MUTED }),
+                    )
+                    .fill(if reeval_enabled { ACCENT_BLUE_DIM } else { SURFACE })
+                    .corner_radius(6.0),
+                );
+                if reeval_btn.clicked() {
+                    reevaluate_clicked = true;
+                }
             }
         });
 
@@ -2524,13 +3433,22 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             }
             self.folds_task.previous_outcomes = None;
         }
+        if revert_clicked {
+            // Open the revert-to-original confirmation modal. The
+            // modal computes the diff from current → DB baseline so
+            // the user sees exactly what's about to happen.
+            self.revert_to_original_confirm = true;
+        }
         if reevaluate_clicked {
             self.start_folds_reevaluate();
         }
 
-        // Navigate after releasing borrows
-        if let Some(idx) = navigate_to {
-            self.model_view = ModelView::DriverDetail(idx);
+        // Navigate after releasing borrows — suppressed during re-eval
+        // so the user stays on the Drivers view and sees the banner.
+        if !reevaluating {
+            if let Some(idx) = navigate_to {
+                self.model_view = ModelView::DriverDetail(idx);
+            }
         }
     }
 
@@ -2894,6 +3812,416 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
 // UI layout
 // ---------------------------------------------------------------------------
 
+impl DashboardApp {
+    /// Lazily decode and upload the mascot texture. Idempotent — safe to
+    /// call every frame. The texture lives for the life of the app and is
+    /// shared between the startup splash and the Help window header.
+    fn ensure_mascot_texture(&mut self, ctx: &egui::Context) {
+        if self.mascot_texture.is_none() {
+            self.mascot_texture = load_mascot_texture(ctx);
+        }
+    }
+
+    /// Render the startup splash overlay. Called from `update()` every
+    /// frame while `self.splash.is_active()` is true. Handles lazy texture
+    /// loading, auto-dismiss after the display window, and click/key
+    /// dismissal. The caller returns early from `update()` so the rest of
+    /// the dashboard chrome is suppressed while the splash is visible.
+    fn render_splash(&mut self, ctx: &egui::Context) {
+        // Display timeline (milliseconds from first shown):
+        //   0       → splash appears
+        //   FADE_IN → fully opaque
+        //   HOLD    → fade-out begins
+        //   DISMISS → splash removed and normal UI takes over
+        //
+        // The base HOLD is the no-loading case. If the app is still
+        // fetching market data when the hold would otherwise elapse, the
+        // hold is extended to cover the fetch; once the fetch completes
+        // an additional POST_LOAD_HOLD_MS of visible "done" state runs
+        // before fade-out kicks in.
+        const FADE_IN_MS: u128 = 260;
+        const HOLD_MS: u128 = 7600;
+        const FADE_OUT_MS: u128 = 420;
+        const DISMISS_MS: u128 = HOLD_MS + FADE_OUT_MS;
+        /// Minimum hold time remaining after a startup fetch completes
+        /// so the user sees a brief "done" state rather than the splash
+        /// vanishing the instant the last row lands.
+        const POST_LOAD_HOLD_MS: u128 = 2000;
+        /// How close to fade-out we're allowed to drift while we're
+        /// still actively loading. Keeps the splash solidly in the Hold
+        /// phase rather than flickering into a partial fade.
+        const LOADING_CLAMP_HEADROOM_MS: u128 = 500;
+
+        // Lazy texture load on the first frame we're active — the egui
+        // context doesn't exist during `new()`, so this has to happen here.
+        self.ensure_mascot_texture(ctx);
+
+        // ── Loading-state tracking ─────────────────────────────────
+        let loading = self.refresh_in_flight;
+        let now = std::time::Instant::now();
+
+        // Record the first frame we saw an in-flight refresh, and the
+        // first frame we saw it drop back to idle after having been in
+        // flight. These two timestamps gate the post-load extension.
+        if loading && self.splash.loading_start.is_none() {
+            self.splash.loading_start = Some(now);
+        }
+        let just_finished_loading = !loading
+            && self.splash.loading_start.is_some()
+            && self.splash.loading_end.is_none();
+        if just_finished_loading {
+            self.splash.loading_end = Some(now);
+        }
+
+        let mut elapsed_ms = self.splash.elapsed().as_millis();
+
+        // While a fetch is in flight, pin the clock inside the Hold
+        // phase. This is how the splash "waits" for the auto-refresh —
+        // we rewind shown_at forward so elapsed never crosses the
+        // HOLD_MS threshold.
+        if loading && elapsed_ms >= HOLD_MS - LOADING_CLAMP_HEADROOM_MS {
+            let anchor_elapsed = HOLD_MS - LOADING_CLAMP_HEADROOM_MS;
+            let anchor = now - std::time::Duration::from_millis(anchor_elapsed as u64);
+            self.splash.shown_at = Some(anchor);
+            elapsed_ms = anchor_elapsed;
+        }
+
+        // When loading transitions from in-flight → done, push the
+        // clock forward so at least POST_LOAD_HOLD_MS of Hold time
+        // remains. If there was already plenty of hold time left (eg.
+        // the fetch finished in 2 seconds), leave the clock alone.
+        if just_finished_loading {
+            let target_elapsed = HOLD_MS.saturating_sub(POST_LOAD_HOLD_MS);
+            if elapsed_ms > target_elapsed {
+                self.splash.shown_at = Some(
+                    now - std::time::Duration::from_millis(target_elapsed as u64),
+                );
+                elapsed_ms = target_elapsed;
+            }
+        }
+
+        // User skip — only allowed once loading has finished. While
+        // the refresh is still running the splash is effectively
+        // modal, because the user asked for the in-flight feed to stay
+        // visible until it's done.
+        let user_skipped = if loading {
+            false
+        } else {
+            ctx.input(|i| {
+                i.pointer.any_click()
+                    || (!i.events.is_empty() && i.keys_down.iter().any(|_| true))
+            })
+        };
+        if user_skipped && elapsed_ms < HOLD_MS {
+            if let Some(start) = self.splash.shown_at {
+                let target = now - std::time::Duration::from_millis(HOLD_MS as u64);
+                if start > target {
+                    self.splash.shown_at = Some(target);
+                    elapsed_ms = HOLD_MS;
+                }
+            }
+        }
+
+        // Auto-dismiss — never fires while we're still loading, because
+        // elapsed_ms is clamped below HOLD_MS above.
+        if elapsed_ms >= DISMISS_MS {
+            self.splash.dismiss();
+            ctx.request_repaint();
+            return;
+        }
+
+        // Keep repainting while the splash is visible so the timer advances
+        // and the fade is smooth.
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+
+        // Snapshot the last few activity-log entries for the loading
+        // readout. Copied into a local so the Area closure below can use
+        // them without an overlapping borrow of `self`. Only taken when
+        // we've seen the refresh at some point during this splash run.
+        let show_activity_readout =
+            self.splash.loading_start.is_some();
+        let activity_snapshot: Vec<(String, String, Color32)> = if show_activity_readout
+        {
+            let n = self.activity_log.len();
+            let start = n.saturating_sub(5);
+            self.activity_log[start..]
+                .iter()
+                .map(|entry| {
+                    let (status_text, status_color) = match &entry.status {
+                        LogStatus::Fetching => {
+                            ("fetching…".to_owned(), TEXT_SECONDARY)
+                        }
+                        LogStatus::Ok(count) => (
+                            format!("loaded {count} pts"),
+                            ALERT_NORMAL_FG,
+                        ),
+                        LogStatus::Cached(date) => {
+                            (format!("cached {date}"), TEXT_MUTED)
+                        }
+                        LogStatus::Failed(err) => {
+                            let brief = err.split('\n').next().unwrap_or(err);
+                            let brief = if brief.len() > 40 {
+                                format!("{}…", &brief[..40])
+                            } else {
+                                brief.to_owned()
+                            };
+                            (format!("failed: {brief}"), ALERT_EXTREME_FG)
+                        }
+                    };
+                    (entry.instrument.as_str().to_owned(), status_text, status_color)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let loading_all_done = show_activity_readout && !loading;
+        let refresh_in_flight_snapshot = loading;
+
+        // Alpha multiplier for fade-in + fade-out.
+        let alpha: f32 = if elapsed_ms < FADE_IN_MS {
+            (elapsed_ms as f32 / FADE_IN_MS as f32).clamp(0.0, 1.0)
+        } else if elapsed_ms < HOLD_MS {
+            1.0
+        } else {
+            let fade_t = (elapsed_ms - HOLD_MS) as f32 / FADE_OUT_MS as f32;
+            (1.0 - fade_t).clamp(0.0, 1.0)
+        };
+        let fade = |c: Color32| -> Color32 {
+            let a = (c.a() as f32 * alpha) as u8;
+            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+        };
+
+        // ── Full-window dark backdrop ──────────────────────────────
+        // Covers whatever would otherwise be visible underneath. Content
+        // is painted by the floating splash card below.
+        let backdrop = egui::Frame::default()
+            .fill(APP_BG)
+            .inner_margin(egui::Margin::ZERO);
+        egui::CentralPanel::default()
+            .frame(backdrop)
+            .show(ctx, |_ui| {});
+
+        // ── Centered floating splash card (Office-style) ───────────
+        // Classic splash pattern: fixed-size card centred on screen,
+        // with a drop-shadow lifting it off the backdrop. Sized for the
+        // portrait-orientation mascot; grows taller when the loading
+        // readout is visible so the extra lines don't cramp the layout.
+        let card_height = if show_activity_readout { 780.0 } else { 640.0 };
+        let card_size = Vec2::new(540.0, card_height);
+        let screen = ctx.screen_rect();
+        let card_pos = egui::pos2(
+            screen.center().x - card_size.x / 2.0,
+            screen.center().y - card_size.y / 2.0,
+        );
+
+        egui::Area::new(egui::Id::new("splash_card"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(card_pos)
+            .show(ctx, |ui| {
+                let shadow_alpha = (140.0 * alpha) as u8;
+                egui::Frame::default()
+                    .fill(fade(SURFACE))
+                    .stroke(egui::Stroke::new(1.0, fade(BORDER)))
+                    .corner_radius(14.0)
+                    .inner_margin(egui::Margin::symmetric(36, 32))
+                    .shadow(egui::epaint::Shadow {
+                        offset: [0, 12],
+                        blur: 48,
+                        spread: 0,
+                        color: Color32::from_black_alpha(shadow_alpha),
+                    })
+                    .show(ui, |ui| {
+                        let inner_w = card_size.x - 72.0;
+                        ui.set_width(inner_w);
+
+                        ui.vertical_centered(|ui| {
+                            // Mascot (or a blank spacer if decoding failed).
+                            if let Some(ref tex) = self.mascot_texture {
+                                let orig = tex.size_vec2();
+                                let target_h = 240.0;
+                                let scale = target_h / orig.y;
+                                let size = orig * scale;
+                                ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::new(
+                                        tex.id(),
+                                        size,
+                                    ))
+                                    .tint(fade(Color32::WHITE)),
+                                );
+                            } else {
+                                ui.add_space(240.0);
+                            }
+
+                            ui.add_space(14.0);
+
+                            // App name — the main branding moment.
+                            ui.label(
+                                RichText::new("The Hedgehog")
+                                    .size(32.0)
+                                    .strong()
+                                    .color(fade(Color32::WHITE)),
+                            );
+
+                            ui.add_space(6.0);
+
+                            // Tagline — carries the "one big thing" idea.
+                            ui.label(
+                                RichText::new(
+                                    "Causal, probabilistic modelling of capital-markets regimes",
+                                )
+                                .size(13.0)
+                                .color(fade(TEXT_SECONDARY)),
+                            );
+
+                            ui.add_space(14.0);
+
+                            // Archilochus / Berlin epigraph — explains
+                            // why this app is a hedgehog.
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "\u{201C}The fox knows many things, but the hedgehog knows one big thing.\u{201D}",
+                                    )
+                                    .size(12.0)
+                                    .italics()
+                                    .color(fade(TEXT_PRIMARY)),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new("Archilochus, via Isaiah Berlin")
+                                    .size(10.0)
+                                    .color(fade(TEXT_MUTED)),
+                            );
+
+                            ui.add_space(18.0);
+
+                            // Version pill — use a non-clickable Button so
+                            // it shrinks to content instead of stretching
+                            // across the card (the issue Frame::show had
+                            // in the previous layout).
+                            let _ = ui.add(
+                                egui::Button::new(
+                                    RichText::new("PREVIEW 0.1")
+                                        .size(11.0)
+                                        .strong()
+                                        .color(fade(ACCENT_BLUE)),
+                                )
+                                .fill(fade(PANEL_BG))
+                                .stroke(egui::Stroke::new(1.0, fade(BORDER)))
+                                .corner_radius(12.0)
+                                .min_size(Vec2::new(0.0, 24.0)),
+                            );
+
+                            // ── Loading readout ────────────────────────
+                            // Shown only when the startup auto-refresh
+                            // was in flight during this splash run.
+                            // Mirrors the activity-log panel but in a
+                            // compressed two-column form (instrument ·
+                            // status), capped to the last 5 entries.
+                            if show_activity_readout {
+                                ui.add_space(18.0);
+                                let header = if refresh_in_flight_snapshot {
+                                    "FETCHING MARKET DATA"
+                                } else {
+                                    "MARKET DATA READY"
+                                };
+                                let header_color = if refresh_in_flight_snapshot
+                                {
+                                    ACCENT_BLUE
+                                } else {
+                                    ALERT_NORMAL_FG
+                                };
+                                ui.label(
+                                    RichText::new(header)
+                                        .size(10.0)
+                                        .strong()
+                                        .color(fade(header_color)),
+                                );
+                                ui.add_space(6.0);
+
+                                // Activity rows. Left-align inside a
+                                // fixed column so wrapping lines up
+                                // cleanly under the first character.
+                                let readout_w = inner_w * 0.8;
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(readout_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        if activity_snapshot.is_empty() {
+                                            ui.label(
+                                                RichText::new("(waiting for first response…)")
+                                                    .size(11.0)
+                                                    .italics()
+                                                    .color(fade(TEXT_MUTED)),
+                                            );
+                                        }
+                                        for (instr, status, status_color) in
+                                            &activity_snapshot
+                                        {
+                                            ui.horizontal(|ui| {
+                                                ui.add_sized(
+                                                    Vec2::new(
+                                                        readout_w * 0.42,
+                                                        16.0,
+                                                    ),
+                                                    egui::Label::new(
+                                                        RichText::new(instr)
+                                                            .size(11.0)
+                                                            .color(fade(
+                                                                TEXT_PRIMARY,
+                                                            )),
+                                                    ),
+                                                );
+                                                ui.label(
+                                                    RichText::new("·")
+                                                        .size(11.0)
+                                                        .color(fade(TEXT_MUTED)),
+                                                );
+                                                ui.add_space(6.0);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(status)
+                                                            .size(11.0)
+                                                            .color(fade(
+                                                                *status_color,
+                                                            )),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            });
+                                        }
+                                    },
+                                );
+                            }
+
+                            // Bottom hint — pinned to the bottom of the
+                            // inner content area. While loading, the
+                            // hint is suppressed because clicks don't
+                            // dismiss until the fetch completes.
+                            let remaining = ui.available_height() - 18.0;
+                            if remaining > 0.0 {
+                                ui.add_space(remaining);
+                            }
+                            let hint_text = if refresh_in_flight_snapshot {
+                                "Loading market data — please wait"
+                            } else if loading_all_done {
+                                "Ready · click anywhere to continue"
+                            } else {
+                                "Click anywhere to continue"
+                            };
+                            ui.label(
+                                RichText::new(hint_text)
+                                    .size(11.0)
+                                    .color(fade(TEXT_MUTED)),
+                            );
+                        });
+                    });
+            });
+    }
+}
+
 impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Fatal init error — show a full-screen message and nothing else.
@@ -2932,6 +4260,16 @@ impl eframe::App for DashboardApp {
         self.poll_folds();
         sanitize_overlay_selection(&mut self.settings);
         self.refresh_analysis_cache();
+
+        // -- Startup splash overlay --
+        // Takes over the whole window until the auto-dismiss timer elapses
+        // or the user clicks / presses a key. Background polling above
+        // continues to run so any auto-refresh kicked off at launch
+        // finishes while the splash is visible.
+        if self.splash.is_active() {
+            self.render_splash(ctx);
+            return;
+        }
 
         // -- Global top bar --
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -2981,13 +4319,62 @@ impl eframe::App for DashboardApp {
 
         self.show_dashboard(ctx);
 
+        // -- Revert-to-original confirmation dialog --
+        // Shown when the user clicks "Revert to original" on the
+        // Drivers tab. Diffs the current in-memory model against the
+        // immutable DB baseline so the user can see exactly what's
+        // about to change before committing.
+        if self.revert_to_original_confirm {
+            let (title, lines, disabled): (String, Vec<String>, bool) = {
+                let baseline = self
+                    .last_inference_id
+                    .and_then(|id| self.storage.load_folds_response_for_inference(id).ok().flatten())
+                    .and_then(|json| serde_json::from_str::<fiftyone_folds::ModelResponse>(&json).ok());
+                let current = self.folds_task.model.as_deref();
+                match (baseline, current) {
+                    (Some(b), Some(c)) => {
+                        let lines = diff_model_states(c, &b);
+                        let disabled = self.folds_task.in_flight
+                            || self.folds_task.reevaluating;
+                        ("Revert to original?".to_owned(), lines, disabled)
+                    }
+                    (None, _) => (
+                        "Original unavailable".to_owned(),
+                        vec!["No baseline stored locally for this model.".to_owned()],
+                        true,
+                    ),
+                    (_, None) => (
+                        "No current state".to_owned(),
+                        vec!["Nothing to revert from.".to_owned()],
+                        true,
+                    ),
+                }
+            };
+            let (cancel, confirm) =
+                render_apply_confirm_dialog(ctx, &title, &lines, disabled);
+            if cancel {
+                self.revert_to_original_confirm = false;
+            }
+            if confirm {
+                self.revert_to_original_confirm = false;
+                self.start_folds_revert_to_original();
+            }
+        }
+
         // -- Help window (accessible from any tab) --
         if self.show_help {
+            // Lazy-load the mascot texture before we hand off a mutable
+            // borrow of `self.show_help` to `Window::open`.
+            self.ensure_mascot_texture(ctx);
             let screen = ctx.screen_rect();
             let win_width = (screen.width() * 0.7).min(900.0).max(500.0);
             let win_height = (screen.height() * 0.85).min(800.0);
+            // Destructure `self` into disjoint field borrows so the
+            // closure below can touch `help_cache` and `mascot_texture`
+            // without conflicting with `Window::open(&mut self.show_help)`.
+            let Self { show_help, help_cache, mascot_texture, .. } = self;
             egui::Window::new("The Hedgehog - Help")
-                .open(&mut self.show_help)
+                .open(show_help)
                 .default_size([win_width, win_height])
                 .default_pos([
                     (screen.width() - win_width) / 2.0,
@@ -2996,9 +4383,10 @@ impl eframe::App for DashboardApp {
                 .resizable(true)
                 .collapsible(false)
                 .show(ctx, |ui| {
+                    render_help_header(ui, mascot_texture.as_ref());
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         egui_commonmark::CommonMarkViewer::new()
-                            .show(ui, &mut self.help_cache, help::HELP_TEXT);
+                            .show(ui, help_cache, help::HELP_TEXT);
                     });
                 });
         }
@@ -3953,6 +5341,285 @@ fn back_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         .fill(Color32::TRANSPARENT)
         .stroke(egui::Stroke::NONE),
     )
+}
+
+/// Full-width banner shown at the top of the 51Folds model explorer
+/// while a driver re-evaluate is in flight. Uses `SURFACE_HOVER` fill
+/// with an `ACCENT_BLUE` left accent border so it reads as "system is
+/// working" without shouting. Paired with egui's built-in spinner.
+fn render_reeval_in_flight_banner(ui: &mut egui::Ui) {
+    egui::Frame::default()
+        .fill(SURFACE_HOVER)
+        .stroke(egui::Stroke::new(1.0, BORDER))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            // Left accent stripe + content row.
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.add_space(10.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("Re-evaluating with your driver changes\u{2026}")
+                            .size(14.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(
+                            "Driver edits are locked while 51Folds recomputes outcome probabilities. This usually takes a few seconds.",
+                        )
+                        .size(12.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                });
+            });
+        });
+}
+
+/// Red error banner shown at the top of the 51Folds model explorer when
+/// a re-evaluate failed. The user's driver edits are preserved so they
+/// can click Re-evaluate again to retry.
+fn render_reeval_error_banner(ui: &mut egui::Ui, err: &str) {
+    egui::Frame::default()
+        .fill(Color32::from_rgb(60, 20, 25))
+        .stroke(egui::Stroke::new(1.0, ALERT_EXTREME_FG))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Re-evaluation failed")
+                        .size(14.0)
+                        .strong()
+                        .color(ALERT_EXTREME_FG),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(err).size(12.0).color(TEXT_PRIMARY),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Your driver edits are preserved. Click Re-evaluate on the Drivers tab to retry.",
+                    )
+                    .size(11.0)
+                    .color(TEXT_SECONDARY),
+                );
+            });
+        });
+}
+
+/// Fading success toast shown at the top of the Outcome tab for a few
+/// seconds after a re-evaluation completes. The alpha multiplier is
+/// computed from the caller's elapsed-time ratio (`0.0..1.0` where 1.0
+/// is fully faded out).
+fn render_reeval_success_toast(ui: &mut egui::Ui, fade_out: f32) {
+    let alpha_f = (1.0 - fade_out).clamp(0.0, 1.0);
+    let fade = |c: Color32| -> Color32 {
+        let a = (c.a() as f32 * alpha_f) as u8;
+        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+    };
+    egui::Frame::default()
+        .fill(fade(Color32::from_rgb(18, 52, 36)))
+        .stroke(egui::Stroke::new(1.0, fade(ALERT_NORMAL_FG)))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(16, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("\u{2713}")
+                        .size(16.0)
+                        .strong()
+                        .color(fade(ALERT_NORMAL_FG)),
+                );
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Outcome probabilities updated from your driver edits. Rows below show before / after deltas.",
+                        )
+                        .size(13.0)
+                        .color(fade(Color32::WHITE)),
+                    )
+                    .wrap(),
+                );
+            });
+        });
+}
+
+/// Render a reusable "apply this change?" confirmation window that
+/// shows a bulleted plain-English diff and Cancel/Apply buttons.
+/// Returns `(cancelled, confirmed)`. Used for both "Apply this
+/// snapshot" (History tab) and "Revert to original" (Drivers tab).
+fn render_apply_confirm_dialog(
+    ctx: &egui::Context,
+    title: &str,
+    lines: &[String],
+    disabled: bool,
+) -> (bool, bool) {
+    let screen = ctx.screen_rect();
+    let win_w = 520.0_f32.min(screen.width() * 0.85);
+    let win_h = 420.0_f32.min(screen.height() * 0.85);
+    let mut cancel = false;
+    let mut confirm = false;
+    egui::Window::new(title)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size([win_w, win_h])
+        .default_pos([
+            (screen.width() - win_w) / 2.0,
+            (screen.height() - win_h) / 2.0,
+        ])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(title)
+                    .size(16.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "Here's what will change. 51Folds will re-infer and return updated probabilities.",
+                )
+                .size(12.0)
+                .color(TEXT_SECONDARY),
+            );
+            ui.add_space(14.0);
+            egui::Frame::default()
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(14, 12))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            if lines.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "(This snapshot is identical to the current state — applying it will have no effect.)",
+                                    )
+                                    .size(12.0)
+                                    .italics()
+                                    .color(TEXT_MUTED),
+                                );
+                            } else {
+                                for line in lines {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!("• {line}"))
+                                                .size(12.0)
+                                                .color(TEXT_PRIMARY),
+                                        )
+                                        .wrap(),
+                                    );
+                                    ui.add_space(3.0);
+                                }
+                            }
+                        });
+                });
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().button_padding = Vec2::new(14.0, 8.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Cancel")
+                                .size(13.0)
+                                .color(TEXT_PRIMARY),
+                        )
+                        .fill(SURFACE)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .corner_radius(6.0),
+                    )
+                    .clicked()
+                {
+                    cancel = true;
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let btn = ui.add_enabled(
+                            !disabled && !lines.is_empty(),
+                            egui::Button::new(
+                                RichText::new("Apply")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(ACCENT_BLUE_DIM)
+                            .corner_radius(6.0),
+                        );
+                        if btn.clicked() {
+                            confirm = true;
+                        }
+                    },
+                );
+            });
+        });
+    (cancel, confirm)
+}
+
+/// Compute a plain-English diff summary between two model states.
+/// Reads `current.drivers[]` and `current.outcomes[]` from each
+/// `ModelResponse` and produces a bulleted list of human-readable
+/// change sentences suitable for the revert-to-original confirmation
+/// dialog.
+fn diff_model_states(
+    from: &fiftyone_folds::ModelResponse,
+    to: &fiftyone_folds::ModelResponse,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Driver state changes — keyed by code.
+    for d in &to.current.drivers {
+        let before = from
+            .current
+            .drivers
+            .iter()
+            .find(|f| f.code == d.code)
+            .map(|f| f.state.as_str());
+        match before {
+            Some(b) if b != d.state => {
+                lines.push(format!("{}: {b} → {}", d.code, d.state));
+            }
+            None => {
+                lines.push(format!("{}: (new) → {}", d.code, d.state));
+            }
+            _ => {}
+        }
+    }
+
+    // Outcome probability shifts — keyed by label.
+    for o in &to.current.outcomes {
+        if let Some(from_o) = from
+            .current
+            .outcomes
+            .iter()
+            .find(|f| f.label == o.label)
+        {
+            let from_prob = from_o.probability.unwrap_or(0.0);
+            let to_prob = o.probability.unwrap_or(0.0);
+            let delta = to_prob - from_prob;
+            if delta.abs() > 0.001 {
+                let arrow = if delta > 0.0 { "↑" } else { "↓" };
+                lines.push(format!(
+                    "{}: {:.1}% → {:.1}% {arrow}",
+                    o.label,
+                    from_prob * 100.0,
+                    to_prob * 100.0,
+                ));
+            }
+        }
+    }
+
+    lines
 }
 
 /// Dark surface card used throughout the 51Folds model explorer — groups

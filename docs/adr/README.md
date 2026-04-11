@@ -45,3 +45,4 @@ Each ADR contains:
 | [0013](0013-sdk-integration-model-explorer-ui.md) | 51Folds Rust SDK Integration, Rich Model Explorer, and Tabbed Central Panel | Accepted | 2026-04-10 |
 | [0014](0014-model-explorer-navigation-stack-ui-redesign.md) | Model Explorer Navigation Stack UI Redesign | Accepted | 2026-04-10 |
 | [0015](0015-dark-theme-hardening-and-51folds-ui-polish.md) | Dark Theme Hardening and 51Folds Model Explorer UI Polish | Accepted | 2026-04-11 |
+| [0016](0016-splash-screen-revert-architecture-and-51folds-patch-drift.md) | Splash Screen, Revert Architecture, and 51Folds PATCH/PUT Drift | In limbo | 2026-04-11 |

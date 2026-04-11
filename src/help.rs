@@ -1,4 +1,13 @@
-pub const HELP_TEXT: &str = r##"# The Hedgehog
+pub const HELP_TEXT: &str = r##"## Why the hedgehog?
+
+> *"The fox knows many things, but the hedgehog knows one big thing."*
+> — Archilochus, via Isaiah Berlin
+
+Isaiah Berlin opens his 1953 essay *The Hedgehog and the Fox* with that line from the Greek poet Archilochus. Foxes see the world in its messy particulars and pursue many ends at once; hedgehogs see it through a single organising idea and subordinate everything else to it.
+
+**This app is a hedgehog.** Its one big thing is **causal, probabilistic modelling of capital-markets regimes** — marrying generative AI, 51Folds Bayesian causal networks, and real-time market data through a single prism. Everything else the app does (the VIX monitor, the commodity overlays, the spike detector, the inference history, the report generator) exists to feed that one prism.
+
+---
 
 ## About
 
@@ -373,6 +382,6 @@ No data is sent to external services other than:
 
 ## Version
 
-The Hedgehog v0.2.0
+The Hedgehog — Preview 0.1
 Built with Rust, egui, and eframe.
 "##;

@@ -3733,7 +3733,7 @@ dependencies = [
 
 [[package]]
 name = "the-hedgehog"
-version = "0.2.0"
+version = "0.1.0-preview"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3741,6 +3741,7 @@ dependencies = [
  "eframe",
  "egui_commonmark",
  "fiftyone-folds",
+ "image",
  "reqwest",
  "rusqlite",
  "serde",
