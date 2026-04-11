@@ -1,5 +1,0 @@
-blank_issues_enabled: false
-contact_links:
-  - name: Documentation and ADRs
-    url: https://github.com/cyclomaticsegal/regime-shift/tree/main/docs
-    about: For background, architecture decisions, or how-it-works questions, read the docs/ folder before opening an issue.
