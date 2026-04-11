@@ -1,0 +1,33 @@
+name: Chore / tech debt
+description: Maintenance, refactor, build, infra, or other non-feature work
+title: "[Chore] "
+labels: ["type:chore"]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this worth doing now? What pain or risk does it address? If this is pure cleanup with no concrete benefit, reconsider.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What files, modules, or systems are affected? Where does the work end?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      value: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and rollback
+      description: What could break? How would we revert if it does?
