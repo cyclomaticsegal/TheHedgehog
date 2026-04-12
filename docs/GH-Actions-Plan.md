@@ -1,6 +1,29 @@
 # GitHub Actions Release Plan — The Hedgehog
 
-**Status:** Proposal — not yet implemented
+**Status:** **IMPLEMENTED** — see [`.github/workflows/release.yml`](../.github/workflows/release.yml) and [`dist-workspace.toml`](../dist-workspace.toml).
+**First release:** [`v0.1.0-preview`](https://github.com/cyclomaticsegal/regime-shift/releases/tag/v0.1.0-preview), cut 2026-04-12. Four target archives, all green.
+**Closes:** issue [#1](https://github.com/cyclomaticsegal/regime-shift/issues/1).
+
+## What we actually shipped
+
+We went with `cargo-dist` rather than the hand-rolled YAML matrix originally sketched in this document. The reasoning and tradeoff are documented on issue #1; the short version is that for a non-Rust-native maintainer, `cargo dist init` abstracts away the target triples, glibc gotchas, and cross-compilation plumbing that would otherwise be hand-written.
+
+The implemented pipeline matches the resolved decisions on #1 exactly:
+
+| Decision | Outcome |
+|---|---|
+| Apple signing | Unsigned. macOS first-run requires right-click → Open. Documented in `INSTALL.txt`. |
+| Targets | macOS aarch64, macOS x86_64, Linux x86_64 glibc, Windows x86_64 MSVC. Four archives. Linux aarch64 and musl deliberately excluded. |
+| Trigger | Tag-triggered on `v*`. Cutting a release is a deliberate `git tag` + `git push`, never automatic. |
+| Hosting | GitHub Releases only. |
+| Tooling | `cargo-dist` v0.31.0. |
+
+The original proposal below is preserved for historical context.
+
+---
+
+**(Original proposal — superseded by the implementation above)**
+
 **Context:** We want a distributable executable for Windows, macOS, and Linux so users can run The Hedgehog without installing Rust and building from source.
 
 ## Short answer

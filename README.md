@@ -67,9 +67,28 @@ When the VIX spikes, it signals institutional repricing of risk. This repricing 
 
 The app's built-in help system includes a full research summary with academic sources and historical episode analysis (2008 GFC, 2020 COVID, 2022 Ukraine).
 
-## New to this? Start here
+## Download The Hedgehog
 
-This is a **desktop app** that runs on your computer — not a website. The steps below will get it running even if you've never used a terminal before. The whole process takes about 10-15 minutes.
+Pre-built binaries are published on the [GitHub Releases page](https://github.com/cyclomaticsegal/regime-shift/releases). You don't need Rust or any build tools — just download, extract, set up your API keys, and run.
+
+| Platform | Download |
+|---|---|
+| macOS — Apple Silicon (M1 / M2 / M3 / M4) | [`the-hedgehog-aarch64-apple-darwin.tar.xz`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-aarch64-apple-darwin.tar.xz) |
+| macOS — Intel | [`the-hedgehog-x86_64-apple-darwin.tar.xz`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-x86_64-apple-darwin.tar.xz) |
+| Linux — x86_64 (glibc) | [`the-hedgehog-x86_64-unknown-linux-gnu.tar.xz`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-x86_64-unknown-linux-gnu.tar.xz) |
+| Windows — x86_64 | [`the-hedgehog-x86_64-pc-windows-msvc.zip`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-x86_64-pc-windows-msvc.zip) |
+
+Each archive contains the binary, an `.env.example` template for your API keys, an `INSTALL.txt` with first-run instructions, and a `README.md`.
+
+> **Heads up — these are unsigned preview builds.** macOS will block the binary on first launch unless you right-click → Open. Windows SmartScreen will show "unrecognized publisher" — click "More info" then "Run anyway". Both are one-time prompts. Full instructions are in `INSTALL.txt` inside each archive.
+
+**Not currently supported:** Linux on ARM (Raspberry Pi, AWS Graviton), Linux distributions using musl (Alpine, Void), and 32-bit anything. If you need one of those, build from source using the steps below.
+
+## Build from source — new to this? Start here
+
+This is a **desktop app** that runs on your computer — not a website. The steps below will get it running from source even if you've never used a terminal before. The whole process takes about 10-15 minutes.
+
+> If you just want to run the app and don't need to modify it, the **Download The Hedgehog** section above is much faster — grab a pre-built binary instead.
 
 ### Step 1 — Open a terminal
 
@@ -107,8 +126,8 @@ You should see `rustc 1.x.x`.
 ### Step 4 — Download the code
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/regime-shift-poc.git
-cd regime-shift-poc
+git clone https://github.com/cyclomaticsegal/regime-shift.git
+cd regime-shift
 ```
 
 ### Step 5 — Get your API keys
@@ -177,8 +196,8 @@ A window will appear — that's the app.
 ### Build and Run
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/regime-shift-poc.git
-cd regime-shift-poc
+git clone https://github.com/cyclomaticsegal/regime-shift.git
+cd regime-shift
 cp .env.example .env
 # Edit .env with your keys
 cargo run --release
