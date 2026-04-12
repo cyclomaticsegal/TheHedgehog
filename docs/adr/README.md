@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-This directory contains Architecture Decision Records (ADRs) for the Regime Shift project.
+This directory contains Architecture Decision Records (ADRs) for The Hedgehog.
 
 ## What is an ADR?
 

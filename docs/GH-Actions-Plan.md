@@ -1,8 +1,8 @@
 # GitHub Actions Release Plan — The Hedgehog
 
 **Status:** **IMPLEMENTED** — see [`.github/workflows/release.yml`](../.github/workflows/release.yml) and [`dist-workspace.toml`](../dist-workspace.toml).
-**First release:** [`v0.1.0-preview`](https://github.com/cyclomaticsegal/regime-shift/releases/tag/v0.1.0-preview), cut 2026-04-12. Four target archives, all green.
-**Closes:** issue [#1](https://github.com/cyclomaticsegal/regime-shift/issues/1).
+**First release:** [`v0.1.0-preview.1`](https://github.com/cyclomaticsegal/TheHedgehog/releases/tag/v0.1.0-preview.1), cut 2026-04-12. Four target archives, all green. (The v0.1.0-preview tag was published first and then deleted after smoke testing surfaced an env_path bug; v0.1.0-preview.1 is the working release.)
+**Closes:** issue [#1](https://github.com/cyclomaticsegal/TheHedgehog/issues/1).
 
 ## What we actually shipped
 
