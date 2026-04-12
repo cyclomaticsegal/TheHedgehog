@@ -3,7 +3,7 @@ name = "the-hedgehog"
 version = "0.1.0-preview.1"
 edition = "2024"
 description = "Causal, probabilistic monitoring of capital-markets regime shifts"
-repository = "https://github.com/cyclomaticsegal/regime-shift"
+repository = "https://github.com/cyclomaticsegal/TheHedgehog"
 license = "LicenseRef-AllRightsReserved"
 
 [dependencies]

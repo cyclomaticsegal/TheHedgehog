@@ -1,10 +1,11 @@
 The Hedgehog — Preview 0.1
 ==========================
 
-Welcome. This is an early-preview build of The Hedgehog, a regime-shift
-monitoring dashboard for capital markets. It is not signed by Apple or
-Microsoft, so the first time you launch it your operating system will
-warn you. The instructions below walk you through it.
+Welcome. This is an early-preview build of The Hedgehog, a causal,
+probabilistic monitoring dashboard for capital-markets regimes. It is
+not signed by Apple or Microsoft, so the first time you launch it your
+operating system will warn you. The instructions below walk you through
+it.
 
 FIRST-RUN INSTRUCTIONS
 ----------------------
@@ -86,5 +87,5 @@ https://app.51folds.ai
 SOURCE AND ISSUES
 -----------------
 
-Source code:  https://github.com/cyclomaticsegal/regime-shift
-Bug reports:  https://github.com/cyclomaticsegal/regime-shift/issues
+Source code:  https://github.com/cyclomaticsegal/TheHedgehog
+Bug reports:  https://github.com/cyclomaticsegal/TheHedgehog/issues

@@ -69,14 +69,14 @@ The app's built-in help system includes a full research summary with academic so
 
 ## Download The Hedgehog
 
-Pre-built binaries are published on the [GitHub Releases page](https://github.com/cyclomaticsegal/regime-shift/releases). You don't need Rust or any build tools — just download, extract, set up your API keys, and run.
+Pre-built binaries are published on the [GitHub Releases page](https://github.com/cyclomaticsegal/TheHedgehog/releases). You don't need Rust or any build tools — just download, extract, set up your API keys, and run.
 
 | Platform | Download |
 |---|---|
-| macOS — Apple Silicon (M1 / M2 / M3 / M4) | [`the-hedgehog-aarch64-apple-darwin.tar.xz`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-aarch64-apple-darwin.tar.xz) |
-| macOS — Intel | [`the-hedgehog-x86_64-apple-darwin.tar.xz`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-x86_64-apple-darwin.tar.xz) |
-| Linux — x86_64 (glibc) | [`the-hedgehog-x86_64-unknown-linux-gnu.tar.xz`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-x86_64-unknown-linux-gnu.tar.xz) |
-| Windows — x86_64 | [`the-hedgehog-x86_64-pc-windows-msvc.zip`](https://github.com/cyclomaticsegal/regime-shift/releases/latest/download/the-hedgehog-x86_64-pc-windows-msvc.zip) |
+| macOS — Apple Silicon (M1 / M2 / M3 / M4) | [`the-hedgehog-aarch64-apple-darwin.tar.xz`](https://github.com/cyclomaticsegal/TheHedgehog/releases/latest/download/the-hedgehog-aarch64-apple-darwin.tar.xz) |
+| macOS — Intel | [`the-hedgehog-x86_64-apple-darwin.tar.xz`](https://github.com/cyclomaticsegal/TheHedgehog/releases/latest/download/the-hedgehog-x86_64-apple-darwin.tar.xz) |
+| Linux — x86_64 (glibc) | [`the-hedgehog-x86_64-unknown-linux-gnu.tar.xz`](https://github.com/cyclomaticsegal/TheHedgehog/releases/latest/download/the-hedgehog-x86_64-unknown-linux-gnu.tar.xz) |
+| Windows — x86_64 | [`the-hedgehog-x86_64-pc-windows-msvc.zip`](https://github.com/cyclomaticsegal/TheHedgehog/releases/latest/download/the-hedgehog-x86_64-pc-windows-msvc.zip) |
 
 Each archive contains the binary, an `.env.example` template for your API keys, an `INSTALL.txt` with first-run instructions, and a `README.md`.
 
@@ -126,8 +126,8 @@ You should see `rustc 1.x.x`.
 ### Step 4 — Download the code
 
 ```bash
-git clone https://github.com/cyclomaticsegal/regime-shift.git
-cd regime-shift
+git clone https://github.com/cyclomaticsegal/TheHedgehog.git
+cd TheHedgehog
 ```
 
 ### Step 5 — Get your API keys
@@ -196,8 +196,8 @@ A window will appear — that's the app.
 ### Build and Run
 
 ```bash
-git clone https://github.com/cyclomaticsegal/regime-shift.git
-cd regime-shift
+git clone https://github.com/cyclomaticsegal/TheHedgehog.git
+cd TheHedgehog
 cp .env.example .env
 # Edit .env with your keys
 cargo run --release

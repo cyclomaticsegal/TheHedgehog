@@ -612,7 +612,7 @@ fn render_help_header(
             ui.add(
                 egui::Label::new(
                     RichText::new(
-                        "Regime-shift monitoring for commodities and risk assets",
+                        "Causal, probabilistic modelling of capital-markets regimes",
                     )
                     .size(13.0)
                     .color(TEXT_SECONDARY),
