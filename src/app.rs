@@ -856,12 +856,27 @@ impl DashboardApp {
         };
         let settings = storage.load_settings().unwrap_or_else(|e| { eprintln!("warn: {e}"); AppSettings::default() });
 
-        // Keys live in .env only — never in the database.
-        // dotenvy::dotenv() returns the path of the loaded file so we know
-        // where to write back when the user saves from the settings panel.
-        let env_path = match dotenvy::dotenv() {
-            Ok(path) => path,
-            Err(_) => std::env::current_dir().unwrap_or_default().join(".env"),
+        // Keys live in .env only — never in the database. We prefer .env
+        // sitting next to the binary (the layout shipped in release
+        // archives, where double-clicking from Finder/Explorer sets the
+        // cwd to something unrelated to the binary's folder), and fall
+        // back to dotenvy's cwd walk for `cargo run` dev workflows where
+        // the binary is in target/release/ but .env is at the project
+        // root. The remembered path is what the Save button writes back to.
+        let exe_neighbour = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join(".env")));
+        let env_path = if let Some(path) = exe_neighbour.as_ref().filter(|p| p.exists()) {
+            if let Err(e) = dotenvy::from_path(path) {
+                eprintln!("warn: failed to load .env from {}: {e}", path.display());
+            }
+            path.clone()
+        } else {
+            match dotenvy::dotenv() {
+                Ok(path) => path,
+                Err(_) => exe_neighbour
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(".env")),
+            }
         };
         let api_keys = ApiKeys::from_env();
 

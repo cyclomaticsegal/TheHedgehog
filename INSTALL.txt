@@ -11,15 +11,28 @@ FIRST-RUN INSTRUCTIONS
 
 1. Set up your API keys.
 
-   - Open the file `.env.example` in this folder with any text editor.
-   - Save it as `.env` in the same folder (rename it; remove `.example`).
-   - Fill in your keys:
+   - In this folder you will find a file named `.env.example`. Make a
+     copy of it and name the copy `.env` (no `.example` suffix). Keep
+     the copy in this same folder, alongside the binary.
+   - Open the new `.env` file with any text editor and fill in your
+     keys. The required ones are:
+
        FRED_API_KEY          — free, https://fred.stlouisfed.org/docs/api/api_key.html
        ALPHA_VANTAGE_API_KEY — free, https://www.alphavantage.co/support/#api-key
-       FOLDS_API_KEY         — https://51folds.ai
 
-   The Hedgehog will not start without at least FRED and Alpha Vantage
-   keys configured.
+     Optional (only needed if you want to use the corresponding feature):
+
+       FOLDS_API_KEY         — https://51folds.ai (Bayesian model creation)
+       ANTHROPIC_API_KEY     — https://console.anthropic.com/ (Claude AI Analysis)
+       OPENAI_API_KEY        — https://platform.openai.com/api-keys (GPT AI Analysis)
+
+     For AI Analysis you only need ONE of Anthropic or OpenAI, not both.
+
+   The Hedgehog will launch without keys, but the dashboard will be
+   empty until at least FRED and Alpha Vantage are configured. The app
+   reads `.env` from the folder where the binary lives, so as long as
+   `.env` is next to `the-hedgehog` (or `the-hedgehog.exe`), it will
+   be picked up however you launch the app.
 
 2. Launch the application.
 
