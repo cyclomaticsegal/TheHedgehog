@@ -1,8 +1,26 @@
-# The Hedgehog
+<p align="center">
+  <img src="artwork/hedgehog-mascot-white-bground.png" alt="The Hedgehog mascot" width="260">
+</p>
 
-A desktop dashboard for monitoring how commodities and risk assets behave during periods of elevated market volatility. Built with Rust and egui.
+<h1 align="center">The Hedgehog</h1>
 
-![Rust](https://img.shields.io/badge/Rust-000000?style=flat&logo=rust&logoColor=white)
+<p align="center">
+  A desktop dashboard for monitoring how commodities and risk assets behave during periods of elevated market volatility. Built with Rust and egui.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-000000?style=flat&logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/status-Preview%200.1-60a5fa?style=flat" alt="Preview 0.1">
+</p>
+
+> *"The fox knows many things, but the hedgehog knows one big thing."*
+> &mdash; Archilochus, via Isaiah Berlin
+
+## Why the hedgehog?
+
+Isaiah Berlin opens his 1953 essay *The Hedgehog and the Fox* with that line from the Greek poet Archilochus. Foxes, Berlin argued, see the world in its messy particulars and pursue many ends at once; hedgehogs see it through a single organising idea and subordinate everything else to it.
+
+**This app is a hedgehog.** Its one big thing is **causal, probabilistic modelling of capital-markets regimes** &mdash; marrying generative AI, [51Folds](https://51folds.ai) Bayesian causal networks, and real-time market data through a single prism. Everything else the app does (the VIX monitor, the commodity overlays, the spike detector, the inference history, the report generator) exists to feed that one prism.
 
 ## What It Does
 
@@ -262,6 +280,9 @@ The project maintains Architecture Decision Records in `docs/adr/`:
 | 0011 | Single-provider daily cache |
 | 0012 | Analysis quality hardening, persistent tracking, editor consolidation |
 | 0013 | 51Folds Rust SDK integration, rich model explorer, tabbed central panel |
+| 0014 | Model explorer navigation stack UI redesign |
+| 0015 | Dark theme hardening and 51Folds model explorer UI polish |
+| 0016 | Splash screen, revert architecture, and 51Folds PATCH/PUT drift (in limbo) |
 
 ## License
 

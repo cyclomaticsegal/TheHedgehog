@@ -1,4 +1,13 @@
-pub const HELP_TEXT: &str = r##"# The Hedgehog
+pub const HELP_TEXT: &str = r##"## Why the hedgehog?
+
+> *"The fox knows many things, but the hedgehog knows one big thing."*
+> — Archilochus, via Isaiah Berlin
+
+Isaiah Berlin opens his 1953 essay *The Hedgehog and the Fox* with that line from the Greek poet Archilochus. Foxes see the world in its messy particulars and pursue many ends at once; hedgehogs see it through a single organising idea and subordinate everything else to it.
+
+**This app is a hedgehog.** Its one big thing is **causal, probabilistic modelling of capital-markets regimes** — marrying generative AI, 51Folds Bayesian causal networks, and real-time market data through a single prism. Everything else the app does (the VIX monitor, the commodity overlays, the spike detector, the inference history, the report generator) exists to feed that one prism.
+
+---
 
 ## About
 
@@ -201,23 +210,121 @@ Alpha Vantage requests include a 1.5-second delay between calls to respect the f
 
 ## AI Analysis
 
-The dashboard can send the current market state to an LLM (Claude or GPT) for regime identification and interpretation. When you click **Analyze Current View** in the sidebar, the app assembles:
+The dashboard can send the current market state to an LLM (Claude or GPT) for regime identification, interpretation, and **hypothesis generation**. When you click **Analyze Current View** in the sidebar, the app assembles:
 
 - The current VIX level, alert status, and thresholds
 - Which instruments you have selected for comparison
 - Each instrument's 30-day price change
 - Any recent VIX spike episodes detected
 
-This snapshot is sent alongside a built-in knowledge base covering VIX mechanics, regime taxonomy (demand shock, supply shock, financial contagion, geopolitical spike), historical episodes, and per-instrument behaviour patterns. The LLM uses this context to identify the likely market regime and highlight notable signals.
+This snapshot is sent alongside a built-in knowledge base covering VIX mechanics, regime taxonomy (demand shock, supply shock, financial contagion, geopolitical spike), historical episodes, and per-instrument behaviour patterns. The LLM uses this context to:
+
+1. Identify the likely current market regime and highlight notable signals
+2. Propose a **hypothesis** — a specific, time-bounded, mechanism-named claim about where a chosen asset is going over the next 7–90 days
+3. Suggest 2–4 mutually exclusive outcomes for that hypothesis
+4. List driver context the downstream 51Folds model will use
+
+Everything after step 1 feeds directly into the 51Folds Model Explorer (see the next section).
 
 ### How it works
-The analysis runs in a background thread — the dashboard remains responsive while waiting for the response. Results are rendered as formatted markdown in the AI Analysis panel at the bottom of the screen.
+The analysis runs in a background thread — the dashboard remains responsive while waiting for the response. Results are rendered as formatted markdown in the AI Analysis panel on the right.
 
 ### Automatic persistence
 Every analysis response is automatically saved to the local database with a timestamp, the VIX reading at the time, and the full prompt context. You never need to manually save an analysis. Past analyses appear in the **History** list in the sidebar and can be reloaded by clicking on them.
 
 ### Panel visibility
 Close the AI panel with the × button. To reopen it, click the **AI** button in the status bar, click any history entry in the sidebar, or run a new analysis.
+
+---
+
+## 51Folds Model Explorer
+
+After an AI Analysis produces a hypothesis, the app can submit it to **51Folds** — a Bayesian modelling service that builds a causal-driver model and returns probability-weighted outcomes plus a full driver graph. The Hedgehog ships with the 51Folds Rust SDK integrated directly: enter your `FOLDS_API_KEY` in `.env`, run an analysis, and the hypothesis editor appears in the right-hand AI panel.
+
+### Creating a model
+
+1. Run an AI Analysis — the right-hand panel shows the regime assessment and a collapsible hypothesis editor
+2. Review and edit the hypothesis, outcomes, and driver context fields (all four are optional — defaults come from the LLM)
+3. Click **Create 51Folds Model**
+4. The panel shows "Model ID: X — building…" while the model is under construction (typically 25–30 minutes for the Advanced tier)
+5. When the model completes, the sidebar summary switches to green **Model ID: X — complete** with the outcome probabilities listed below, and the central panel auto-switches from Charts to **51Folds**
+
+Models persist across restarts. If you close the app while a model is building, the resume sweep will re-attach the polling thread on next launch and update the sidebar once the SDK reports completion (or gives up after 35 minutes).
+
+### Charts vs 51Folds tabs
+
+The central panel has two top-level views selectable from the sub-toolbar:
+
+- **Charts** — VIX time series, asset-performance-vs-VIX comparison chart, optional price panel (press `[P]`). This is what you see before running any AI analysis.
+- **51Folds** — the Model Explorer. Disabled (greyed) until a model has been completed for the current inference. The label turns blue once a model is available.
+
+Inside the 51Folds tab there are two sub-views selectable from the sub-toolbar: **Outcome** and **Drivers**.
+
+### Outcome view
+
+Shows the model's answer in card form:
+
+- The **question / hypothesis** as the page heading
+- An **Outcome probabilities** card with one row per outcome: label on the left, proportional blue bar, percentage on the right
+- A **Take away** card — a plain-English summary from the model
+- A **Show me the drivers ›** call-to-action that jumps to the Drivers view
+
+After you re-evaluate the model (see below), each outcome also shows a delta annotation (`↑ up from X%` / `↓ down from X%`) in green / red so you can see how your driver edits shifted the probabilities.
+
+### Drivers view
+
+Shows every causal driver the model is tracking as a dark card with:
+
+- The driver's name and short code, e.g. `Real Interest Rates (RIR)`
+- A row of **state pills** — Negligent / Low / Medium / High / Extreme (or whatever custom states the model defines). The currently-selected state is highlighted in blue.
+- A **Details ›** button on the right that navigates to the full driver detail page
+
+Below the driver list:
+- **Reset** — reverts every driver back to the model's original selected states
+- **Re-evaluate** — sends your current driver edits to 51Folds and returns updated outcome probabilities. The Outcome view will show deltas after this completes.
+
+Click a pill to change a driver's state. The driver name turns amber when you've diverged from the original. Re-evaluate applies all edits in a single patch call.
+
+### Driver detail pages
+
+Clicking **Details ›** on a driver row opens a dedicated page:
+
+- Back button in the top-left (`‹ Drivers`)
+- Driver name as the page heading
+- **Current state** card showing the selected state name and its description
+- **All states** card listing every possible state with its description, current state highlighted in blue
+- A **Related** list with four navigable rows:
+  - **Why was [original state] selected?** — the model's justification for the initial assignment, with numbered citations to source URLs
+  - **Why does this matter?** — the driver's importance to the hypothesis
+  - **What could shift?** — what market conditions would push the driver into a different state
+  - **What should we monitor?** — observable indicators that track this driver
+
+Each Related row opens a full-page content screen with its own back button. Citations appear in a **Sources** card with clickable URLs.
+
+### Sidebar summary
+
+While a model is building or complete, the right-hand AI panel shows a compact 51Folds summary underneath the regime text:
+
+- **Model ID: X — complete** (green, when finished)
+- Each outcome on its own line: percentage followed by the outcome label
+- A **View in 51Folds tab** button that jumps to the central-panel Outcome view
+
+If the model is still building, the spinner + "Model ID: X — building…" message is shown instead. If an error occurs, the red error text replaces both.
+
+### Navigating back
+
+Every detail / section page has a back button in the top-left. The navigation stack is:
+
+```
+Outcome ────────────────┐
+                        │
+Drivers ─→ DriverDetail ─→ DriverSection
+  ↑            ↑              │
+  └────────────┴──────────────┘
+         Back buttons
+```
+
+The Outcome and Drivers top-level views are reachable from the sub-toolbar at any time.
 
 ---
 
@@ -275,6 +382,6 @@ No data is sent to external services other than:
 
 ## Version
 
-The Hedgehog v0.2.0
+The Hedgehog — Preview 0.1
 Built with Rust, egui, and eframe.
 "##;

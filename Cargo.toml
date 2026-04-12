@@ -1,6 +1,6 @@
 [package]
 name = "the-hedgehog"
-version = "0.2.0"
+version = "0.1.0-preview"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ anyhow = "1.0"
 dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
 eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }

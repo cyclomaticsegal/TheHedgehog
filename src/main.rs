@@ -8,7 +8,7 @@ mod models;
 mod providers;
 mod storage;
 
-pub(crate) const USER_AGENT: &str = "the-hedgehog/0.2.0";
+pub(crate) const USER_AGENT: &str = "the-hedgehog/0.1.0-preview";
 
 use eframe::egui;
 

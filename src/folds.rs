@@ -30,8 +30,16 @@ pub enum FoldsResult {
     /// Full model response once the build is complete. Boxed because the
     /// response is large (drivers, edges, context, justification).
     Completed(Box<ModelResponse>),
+    /// Fresh model response after a manual Refresh — same payload shape
+    /// as `Completed`, but the UI treats it differently (no navigation,
+    /// no toast, no loading banner; just rehydrates state silently).
+    Refreshed(Box<ModelResponse>),
     /// Irrecoverable error — network failure, timeout, or model build failed.
     Failed(String),
+    /// Non-fatal refresh error — the user clicked Refresh and we
+    /// couldn't reach the server. Surfaced as an inline banner, not a
+    /// modal blocker, so the user can keep using what's already loaded.
+    RefreshFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +164,21 @@ pub fn create_and_poll(
 // ---------------------------------------------------------------------------
 
 /// Re-evaluate: change driver states and get updated outcome probabilities.
-/// The 51Folds API returns the updated ModelResponse in the same request
-/// (no polling needed for driver patches).
+///
+/// **The PATCH is asynchronous.** The server immediately acknowledges
+/// with `{modelId, status: "Running"}` and re-inference happens in the
+/// background. A bare GET right after the PATCH is a race: if you fire
+/// it before the re-inference finishes, you get stale outcomes. The
+/// fix is to poll with `wait_until_complete` — same mechanism
+/// `create_and_poll` uses for initial builds, but with a faster
+/// polling interval and shorter timeout since post-PATCH re-inference
+/// takes seconds rather than minutes.
+///
+/// **Does not touch the database.** The DB's `response_json` column is
+/// the immutable initial-build snapshot — our "original archive" for a
+/// given model. Re-evaluations update only in-memory state so that a
+/// subsequent app restart still loads the pristine original from the
+/// DB. Session-scoped history is tracked client-side in memory.
 pub fn patch_drivers(
     api_key: String,
     model_id: String,
@@ -169,17 +190,191 @@ pub fn patch_drivers(
         let client = match build_client(&api_key) {
             Ok(c) => c,
             Err(e) => {
+                eprintln!("[folds] patch_drivers: build_client failed: {e}");
                 let _ = tx.send(FoldsResult::Failed(format!("{e}")));
                 return;
             }
         };
 
+        // Step 1: fire the PATCH. The response body is a minimal ack
+        // (`{modelId, status: "Running"}`) — discard it and wait for
+        // re-inference via polling.
         match client.models().patch_drivers(&model_id, &drivers).await {
+            Ok(_ack) => {}
+            Err(e) => {
+                eprintln!("[folds] patch_drivers: PATCH error = {e:?}");
+                let _ = tx.send(FoldsResult::Failed(format!("{e}")));
+                return;
+            }
+        }
+
+        // Step 2: poll until re-inference finishes. Post-PATCH
+        // re-inference is fast (seconds), so use a tight polling
+        // interval and a 60-second timeout rather than the 35-minute
+        // ceiling used for initial builds.
+        let poll_config = PollConfig {
+            interval: Duration::from_secs(2),
+            timeout: Duration::from_secs(60),
+        };
+        match client
+            .models()
+            .wait_until_complete(&model_id, Some(poll_config))
+            .await
+        {
             Ok(model) => {
+                if model.current.outcomes.is_empty() || model.drivers.is_empty() {
+                    eprintln!(
+                        "[folds] patch_drivers: post-reeval model is incomplete"
+                    );
+                    let _ = tx.send(FoldsResult::Failed(
+                        "51Folds returned an incomplete model after re-evaluation."
+                            .to_owned(),
+                    ));
+                    return;
+                }
                 let _ = tx.send(FoldsResult::Completed(Box::new(model)));
             }
+            Err(FoldsError::PollTimeout { message }) => {
+                eprintln!("[folds] patch_drivers: poll timeout = {message}");
+                let _ = tx.send(FoldsResult::Failed(format!(
+                    "Re-evaluate timed out: {message}"
+                )));
+            }
             Err(e) => {
+                eprintln!("[folds] patch_drivers: wait error = {e:?}");
+                let _ = tx.send(FoldsResult::Failed(format!(
+                    "Re-evaluate failed while waiting for result: {e}"
+                )));
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Revert all drivers atomically (PUT /drivers)
+// ---------------------------------------------------------------------------
+
+/// Atomic "set every driver to this" via PUT `/api/v1/models/{id}/drivers`.
+/// Used by the Revert-to-original flow because PUT replaces all driver
+/// states in one shot, whereas PATCH is a partial merge with semantics
+/// that have been observed to leave subtle inference drift between the
+/// "reverted" state and the true original. After the PUT, we
+/// `wait_until_complete` so the returned model has the final
+/// re-inference result.
+pub fn put_drivers(
+    api_key: String,
+    model_id: String,
+    drivers: Vec<fiftyone_folds::DriverStateInput>,
+    tx: Sender<FoldsResult>,
+) {
+    let rt = build_runtime();
+    rt.block_on(async {
+        let client = match build_client(&api_key) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[folds] put_drivers: build_client failed: {e}");
                 let _ = tx.send(FoldsResult::Failed(format!("{e}")));
+                return;
+            }
+        };
+
+        // PUT is "replace all driver states" — used for revert-to-
+        // original so the server re-infers from the exact baseline
+        // driver set atomically.
+        match client.models().update_drivers(&model_id, &drivers).await {
+            Ok(_ack) => {}
+            Err(e) => {
+                eprintln!("[folds] put_drivers: PUT error = {e:?}");
+                let _ = tx.send(FoldsResult::Failed(format!("{e}")));
+                return;
+            }
+        }
+
+        // Wait for re-inference to finish before reading the result.
+        let poll_config = PollConfig {
+            interval: Duration::from_secs(2),
+            timeout: Duration::from_secs(60),
+        };
+        match client
+            .models()
+            .wait_until_complete(&model_id, Some(poll_config))
+            .await
+        {
+            Ok(model) => {
+                if model.current.outcomes.is_empty() || model.drivers.is_empty() {
+                    eprintln!(
+                        "[folds] put_drivers: post-revert model is incomplete"
+                    );
+                    let _ = tx.send(FoldsResult::Failed(
+                        "51Folds returned an incomplete model after revert."
+                            .to_owned(),
+                    ));
+                    return;
+                }
+                let _ = tx.send(FoldsResult::Completed(Box::new(model)));
+            }
+            Err(FoldsError::PollTimeout { message }) => {
+                eprintln!("[folds] put_drivers: poll timeout = {message}");
+                let _ = tx.send(FoldsResult::Failed(format!(
+                    "Revert timed out: {message}"
+                )));
+            }
+            Err(e) => {
+                eprintln!("[folds] put_drivers: wait error = {e:?}");
+                let _ = tx.send(FoldsResult::Failed(format!(
+                    "Revert failed while waiting for result: {e}"
+                )));
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Refresh a single model from the server
+// ---------------------------------------------------------------------------
+
+/// Fetch the latest `ModelResponse` for an already-built model and
+/// persist it back to the `folds_models` row. This is the user-facing
+/// "Refresh Model" action — useful when the local DB has drifted out of
+/// sync with the server (for example, a re-eval that ran before this
+/// app version added post-patch persistence).
+pub fn refresh_model(
+    api_key: String,
+    model_id: String,
+    db_path: PathBuf,
+    tx: Sender<FoldsResult>,
+) {
+    let rt = build_runtime();
+    rt.block_on(async {
+        let client = match build_client(&api_key) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[folds] refresh_model: build_client failed: {e}");
+                let _ = tx.send(FoldsResult::RefreshFailed(format!("{e}")));
+                return;
+            }
+        };
+
+        match client.models().get(&model_id, None, None).await {
+            Ok(model) => {
+                // Defensive: the server has been observed returning
+                // stub responses. Refuse to persist an empty blob.
+                if model.current.outcomes.is_empty() || model.drivers.is_empty() {
+                    eprintln!(
+                        "[folds] refresh_model: stub response, refusing to persist"
+                    );
+                    let _ = tx.send(FoldsResult::RefreshFailed(
+                        "51Folds returned an incomplete model. Try again in a moment."
+                            .to_owned(),
+                    ));
+                    return;
+                }
+                persist_completed(&db_path, &model_id, &model);
+                let _ = tx.send(FoldsResult::Refreshed(Box::new(model)));
+            }
+            Err(e) => {
+                eprintln!("[folds] refresh_model: error = {e:?}");
+                let _ = tx.send(FoldsResult::RefreshFailed(format!("{e}")));
             }
         }
     });
