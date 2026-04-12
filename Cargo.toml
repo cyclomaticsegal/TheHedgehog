@@ -2,6 +2,9 @@
 name = "the-hedgehog"
 version = "0.1.0-preview"
 edition = "2024"
+description = "Causal, probabilistic monitoring of capital-markets regime shifts"
+repository = "https://github.com/cyclomaticsegal/regime-shift"
+license = "LicenseRef-AllRightsReserved"
 
 [dependencies]
 anyhow = "1.0"
@@ -17,3 +20,8 @@ egui_commonmark = "0.20"
 uuid = { version = "1", features = ["v4"] }
 fiftyone-folds = { path = "vendor/fiftyone-folds" }
 tokio = { version = "1", features = ["rt", "time"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
