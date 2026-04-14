@@ -6,6 +6,7 @@ mod help;
 mod knowledge;
 mod models;
 mod providers;
+mod eval;
 mod storage;
 
 pub(crate) const USER_AGENT: &str = "the-hedgehog/0.1.0-preview";

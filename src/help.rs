@@ -107,7 +107,7 @@ Shows the current VIX reading, alert level, date, and threshold values. The colo
 - **Amber (Approaching Extreme)** — VIX is between the approaching and extreme thresholds
 - **Red (EXTREME)** — VIX is above the extreme threshold
 
-#### Compare Against VIX
+#### Overlay on VIX
 Select which assets appear on the comparison chart. Each instrument has a colored swatch showing its chart color (dimmed when deselected, bright when selected). Quick-select buttons: Core 3, Energy, Metals, All, Clear.
 
 #### Recent Spikes
@@ -237,6 +237,58 @@ Close the AI panel with the × button. To reopen it, click the **AI** button in 
 
 ---
 
+## Commodity-Bias Validation
+
+Every AI analysis is automatically validated for commodity bias — both before the prompt is sent and after the response is received. The results appear in a **Bias Check** bar between the analysis response and the 51Folds section.
+
+### Two layers
+
+**Structural checks (instant, deterministic)** — run the moment the response arrives. No LLM call needed. These verify:
+- The hypothesis names at least one of the instruments the user selected (not a different commodity)
+- No unselected instrument appears as the grammatical subject of the hypothesis
+- Dollar amounts in the hypothesis are anchored to the latest closing prices, not stale training-data figures (e.g. citing gold at $2,000 when the latest close is $4,624)
+
+**Semantic checks (async, LLM judge)** — a second, focused LLM call that validates the analysis against five rules:
+- **SUBJECT_MATCH** — is the hypothesis actually about the selected instruments?
+- **PRICE_ANCHORING** — are cited prices consistent with the latest closes?
+- **MECHANISM_RELEVANCE** — is the causal mechanism specific to the selected instruments, or generic filler?
+- **TERTIARY_BOUNDARY** — are non-selected instruments kept as background context, not subjects?
+- **OUTCOME_ALIGNMENT** — do outcome bands reference the right instruments with distinct causal paths?
+
+### Cross-model validation
+
+When you have API keys for both Claude and GPT, the bias judge automatically uses the **other** provider — the one that did NOT produce the analysis. If Claude wrote the analysis, GPT judges it (and vice versa). This gives you independent cross-model validation for free, with no extra configuration.
+
+If only one key is present, the judge uses the same provider. This is still useful because the judge prompt is a validation task (rule-based checklist), which is structurally different from the creative generation task.
+
+### Reading the Bias Check bar
+
+The bar shows two counts:
+- **Structural** — e.g. "3/3 structural" (green if all pass, red if any fail)
+- **Semantic** — e.g. "5/5 semantic (GPT)" (shows which provider judged; spinner while in flight)
+
+If any rule fails, the failing rule name and reason are listed below the bar.
+
+---
+
+## Research Agent
+
+The **Research** tab in the central panel provides an embedded terminal running the Dexter financial research agent. Dexter is a conversational AI agent with access to financial data tools (market data, filings, earnings, stock screening), web search, and a persistent memory system.
+
+### Getting started
+
+1. Install [Bun](https://bun.sh) (the JavaScript runtime Dexter runs on) — the app checks for it automatically
+2. Make sure you have at least one LLM API key configured (Anthropic or OpenAI)
+3. Click the **Research** tab in the central panel
+
+The agent launches in an embedded terminal. You can interact with it directly — ask questions, request research, and it will use its tools to find answers.
+
+### Provider selection
+
+The Research Agent uses the provider configured in the sidebar under **Settings > Research Agent**. This is independent of the AI Analysis provider, so you can run analysis on Claude while the research agent uses GPT (or vice versa).
+
+---
+
 ## 51Folds Model Explorer
 
 After an AI Analysis produces a hypothesis, the app can submit it to **51Folds** — a Bayesian modelling service that builds a causal-driver model and returns probability-weighted outcomes plus a full driver graph. The Hedgehog ships with the 51Folds Rust SDK integrated directly: enter your `FOLDS_API_KEY` in `.env`, run an analysis, and the hypothesis editor appears in the right-hand AI panel.
@@ -354,10 +406,10 @@ Generated reports are themselves saved to the database, so they appear in future
 ## Data Sources
 
 ### FRED (Federal Reserve Economic Data)
-Provides the VIX daily close series (VIXCLS) and the Global Soybeans price series (PSOYBUSDM). Free API with generous rate limits.
+Provides the VIX daily close series (VIXCLS). Free API with generous rate limits.
 
 ### Alpha Vantage
-Provides daily spot prices for all other commodities — Gold, Silver, Crude Oil (WTI), Natural Gas, Copper, Aluminum, Wheat, Corn — and Bitcoin via the digital-currency endpoint. Free tier: 25 requests/day, 1 request/second.
+Provides daily spot prices for all commodities — Gold, Silver, Crude Oil (WTI), Natural Gas, Copper, Aluminum, Wheat, Corn, Soybeans — and Bitcoin via the digital-currency endpoint. Free tier: 25 requests/day, 1 request/second.
 
 The Hedgehog uses spot prices rather than ETF proxies because regime-shift analysis is sensitive to absolute price levels and percentile thresholds, and ETF tracking error / contango drift would muddy the signal.
 

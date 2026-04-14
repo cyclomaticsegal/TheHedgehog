@@ -456,6 +456,23 @@ impl Storage {
         }
     }
 
+    /// Load the 51Folds model status for each inference that has a linked
+    /// model. Returns a map of `inference_id → (model_id, status)`.
+    pub fn load_folds_status_by_inference(&self) -> Result<std::collections::HashMap<i64, (String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT inference_id, model_id, status FROM folds_models WHERE inference_id IS NOT NULL",
+        )?;
+        let mut map = std::collections::HashMap::new();
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let inf_id: i64 = row.get(0)?;
+            let model_id: String = row.get(1)?;
+            let status: String = row.get(2)?;
+            map.insert(inf_id, (model_id, status));
+        }
+        Ok(map)
+    }
+
     /// Update a row's status (and completed_at if terminal). Used by the
     /// foreground when only one model is in flight via FoldsTask; the
     /// polling threads update via the standalone helper.

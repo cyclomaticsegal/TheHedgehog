@@ -39,7 +39,9 @@ The dashboard provides:
 - **Drag-to-zoom** on any chart to focus on a specific date range
 - **Price panel** — press [P] to open a quick-pick panel for any individual instrument's raw price chart
 - **Spike episode detection** with clickable highlights
-- **Live data** — FRED for VIX and Soybeans, Alpha Vantage for all other commodities (daily spot closes)
+- **Commodity-bias validation** — every AI analysis is automatically checked for instrument bias, price anchoring, and subject drift, both deterministically and via an LLM judge (cross-model when two API keys are present)
+- **Embedded research agent** — a Research Agent tab runs the Dexter financial research CLI in an embedded terminal, using your existing LLM keys
+- **Live data** — FRED for VIX, Alpha Vantage for all commodities including Soybeans (daily spot closes)
 - **Daily cache** — same-day re-launches reuse stored data so the API quota only burns once per trading day
 
 ## 51Folds Integration
@@ -189,8 +191,8 @@ A window will appear — that's the app.
 
 - [Rust](https://rustup.rs/) (stable toolchain)
 - API keys (both free tiers):
-  - **FRED** (required for VIX, Soybeans) — [fred.stlouisfed.org](https://fred.stlouisfed.org/) > Account > API Keys
-  - **Alpha Vantage** (required for all other commodities) — [alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key) (25 requests/day)
+  - **FRED** (required for VIX) — [fred.stlouisfed.org](https://fred.stlouisfed.org/) > Account > API Keys
+  - **Alpha Vantage** (required for all commodities) — [alphavantage.co/support/#api-key](https://www.alphavantage.co/support/#api-key) (25 requests/day)
   - **51Folds** (optional) — [51folds.ai](https://51folds.ai) for Bayesian model creation
 
 ### Build and Run
@@ -211,7 +213,7 @@ All dependencies — including the 51Folds SDK — are either on crates.io or ve
 
 | Control | Function |
 |---------|----------|
-| Charts / 51Folds | Switch the central panel between market charts and the model explorer |
+| Charts / 51Folds / Research | Switch the central panel between market charts, the model explorer, and the embedded research agent |
 | Outcome / Drivers | Sub-tabs within the 51Folds model explorer |
 | 1M / 3M / 6M / 1Y / All | Time window selection (Charts view only) |
 | Refresh | Fetch fresh data from all providers |
@@ -222,7 +224,7 @@ All dependencies — including the 51Folds SDK — are either on crates.io or ve
 ### Sidebar
 
 - **VIX Status** — Current reading, alert level, and threshold values
-- **Compare Against VIX** — Select which assets appear on the comparison chart
+- **Overlay on VIX** — Select which assets appear on the comparison chart
 - **Recent Spikes** — Detected VIX spike episodes (click to highlight on chart)
 - **Data Source** — API key entry with set/not-set badges and auto-refresh toggle
 - **AI Analysis** — LLM provider/model selector, analyze button, and inference history
@@ -251,8 +253,8 @@ All dependencies — including the 51Folds SDK — are either on crates.io or ve
 
 | Provider | Instruments | Free Tier |
 |----------|------------|-----------|
-| FRED | VIX (VIXCLS), Soybeans (PSOYBUSDM) | Generous, no practical limit |
-| Alpha Vantage | Gold, Silver, Bitcoin, Crude Oil (WTI), Natural Gas, Copper, Aluminum, Wheat, Corn | 25 requests/day, 1 req/sec |
+| FRED | VIX (VIXCLS) | Generous, no practical limit |
+| Alpha Vantage | Gold, Silver, Bitcoin, Crude Oil (WTI), Natural Gas, Copper, Aluminum, Wheat, Corn, Soybeans | 25 requests/day, 1 req/sec |
 | 51Folds | Bayesian causal models | Requires account and API key |
 
 All market data is stored locally in SQLite. The daily cache means each instrument is fetched at most once per trading day. No data is sent to external services beyond API fetch requests (FRED, Alpha Vantage), optional LLM calls (Anthropic, OpenAI) when using AI Analysis, and optional 51Folds API calls when creating Bayesian models.
@@ -267,6 +269,7 @@ src/
   analysis.rs      VIX status, spike detection, percentile computation
   providers.rs     FRED + Alpha Vantage API integration
   ai.rs            LLM provider abstraction (Anthropic + OpenAI), hypothesis generation
+  eval.rs          Commodity-bias validation (deterministic checks + LLM judge)
   folds.rs         51Folds SDK bridge (async SDK <-> sync thread via tokio runtime)
   knowledge.rs     RAG knowledge base: VIX/commodity regime analysis chunks
   storage.rs       SQLite persistence layer
@@ -274,10 +277,12 @@ src/
 
 vendor/
   fiftyone-folds/  Vendored 51Folds Rust SDK (compiled from source during build)
+  dexter/          Vendored Dexter research agent (TypeScript/Bun CLI)
 
 docs/
   adr/             Architecture Decision Records
   specs/           Product specifications
+  vendor-integrations/  Vendor integration notes (Dexter)
 ```
 
 ## Architecture Decisions

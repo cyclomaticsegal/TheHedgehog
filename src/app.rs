@@ -1,5 +1,6 @@
 use crate::ai;
 use crate::analysis;
+use crate::eval;
 use crate::help;
 use crate::knowledge;
 use crate::models::{
@@ -380,6 +381,9 @@ impl FoldsTask {
                     self.model = Some(model);
                     self.refresh_in_flight = false;
                     self.refresh_error = None;
+                    // Clear any stale re-evaluation error — the fresh
+                    // model state from the server supersedes it.
+                    self.error = None;
                     self.init_draft_drivers();
                     // Refresh replaces in-memory state with server
                     // state, but does NOT create a history entry —
@@ -552,10 +556,24 @@ pub struct DashboardApp {
     /// If set, a modal confirmation is asking the user to approve
     /// reverting to the original (from the DB baseline).
     revert_to_original_confirm: bool,
+    /// Maps inference_id → (model_id, status) for showing 51Folds badges
+    /// in the history list and report window.
+    folds_status_by_inference: std::collections::HashMap<i64, (String, String)>,
     /// Embedded Dexter terminal state (lazy-initialized on first tab switch).
     research_terminal: ResearchTerminal,
     /// Cached egui Context for TerminalBackend creation outside update().
     egui_ctx: egui::Context,
+    // -- Commodity-bias validation ------------------------------------------
+    /// Deterministic response validation results (populated instantly after
+    /// each analysis completes).
+    bias_deterministic: Vec<eval::ResponseValidation>,
+    /// LLM judge results (populated asynchronously after the judge call
+    /// completes; `None` while in flight or if no analysis has run).
+    bias_judge_results: Option<Vec<eval::ResponseValidation>>,
+    /// Which provider is running the judge (for display).
+    bias_judge_provider: Option<LlmProvider>,
+    /// Background LLM task for the bias judge.
+    bias_judge_task: LlmTask,
 }
 
 /// Mascot PNG embedded at compile time (transparent background — chosen
@@ -651,19 +669,25 @@ fn render_help_header(
                 )
                 .wrap(),
             );
-            ui.add_space(6.0);
-            let _ = ui.add(
-                egui::Button::new(
-                    RichText::new("PREVIEW 0.1")
-                        .size(10.0)
-                        .strong()
-                        .color(ACCENT_BLUE),
-                )
+            ui.add_space(10.0);
+            egui::Frame::default()
                 .fill(PANEL_BG)
                 .stroke(egui::Stroke::new(1.0, BORDER))
-                .corner_radius(10.0)
-                .min_size(Vec2::new(0.0, 20.0)),
-            );
+                .corner_radius(16.0)
+                .inner_margin(egui::Margin {
+                    left: 40,
+                    right: 40,
+                    top: 14,
+                    bottom: 14,
+                })
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("PREVIEW 0.1")
+                            .size(13.0)
+                            .strong()
+                            .color(ACCENT_BLUE),
+                    );
+                });
         });
     });
     ui.add_space(12.0);
@@ -974,8 +998,13 @@ impl DashboardApp {
             mascot_texture: None,
             reeval_toast_until: None,
             revert_to_original_confirm: false,
+            folds_status_by_inference: std::collections::HashMap::new(),
             research_terminal: ResearchTerminal::new(),
             egui_ctx: _cc.egui_ctx.clone(),
+            bias_deterministic: Vec::new(),
+            bias_judge_results: None,
+            bias_judge_provider: None,
+            bias_judge_task: LlmTask::new(),
         };
 
         // Skip data loading and auto-refresh if the database couldn't be opened;
@@ -1660,6 +1689,68 @@ impl DashboardApp {
                 );
                 self.last_inference_id = inference_id.ok();
 
+                // -- Commodity-bias validation (Layer 1: deterministic) --------
+                self.bias_deterministic.clear();
+                self.bias_judge_results = None;
+
+                if let Some(ref hyp) = hypothesis {
+                    let snapshots: Vec<ai::InstrumentSnapshot> = self
+                        .settings
+                        .overlay_instruments
+                        .iter()
+                        .map(|&inst| ai::InstrumentSnapshot::from_series(inst, self.series(inst)))
+                        .collect();
+
+                    let response_scenario = eval::ResponseScenario::from_analysis(
+                        &self.settings.overlay_instruments,
+                        &snapshots,
+                        &hyp.question,
+                        &hyp.outcomes,
+                        &hyp.context,
+                    );
+                    self.bias_deterministic = eval::validate_response(&response_scenario);
+
+                    // -- Layer 2: LLM judge (async, cross-model when possible)
+                    // Prefer the OTHER provider for independent validation.
+                    // Fall back to the analysis provider if only one key exists.
+                    let analysis_provider = self.settings.ai_provider;
+                    let other_provider = match analysis_provider {
+                        LlmProvider::Anthropic => LlmProvider::OpenAI,
+                        LlmProvider::OpenAI => LlmProvider::Anthropic,
+                    };
+                    let other_key = self.api_keys.ai_key_for(other_provider).trim().to_owned();
+                    let (judge_provider, judge_key) = if !other_key.is_empty() {
+                        (other_provider, other_key)
+                    } else {
+                        let same_key = self.api_keys.ai_key_for(analysis_provider).trim().to_owned();
+                        (analysis_provider, same_key)
+                    };
+
+                    if !judge_key.is_empty() {
+                        let judge_model = judge_provider.default_model().to_owned();
+                        self.bias_judge_provider = Some(judge_provider);
+
+                        let (judge_sys, judge_usr) = eval::assemble_bias_judge_prompt(
+                            &self.settings.overlay_instruments,
+                            &snapshots,
+                            &result.response,
+                        );
+                        let judge_request = ai::AiRequest {
+                            provider: judge_provider,
+                            api_key: judge_key,
+                            model: judge_model,
+                            max_tokens: 512,
+                            system_prompt: judge_sys,
+                            user_message: judge_usr,
+                        };
+                        let (jtx, jrx) = mpsc::channel();
+                        self.bias_judge_task.start(jrx);
+                        thread::spawn(move || {
+                            ai::run_analysis(judge_request, jtx);
+                        });
+                    }
+                }
+
                 self.parsed_hypothesis = hypothesis.clone();
                 self.draft_hypothesis = hypothesis;
                 self.folds_task.reset();
@@ -1667,6 +1758,33 @@ impl DashboardApp {
                 self.reload_inference_history();
             }
             LlmPoll::Failed | LlmPoll::Pending | LlmPoll::Idle => {}
+        }
+    }
+
+    /// Poll the background LLM bias-judge task. When it completes,
+    /// parse the structured output into `ResponseValidation` results.
+    fn poll_bias_judge(&mut self) {
+        match self.bias_judge_task.poll() {
+            LlmPoll::Response(result) => {
+                self.bias_judge_results =
+                    Some(eval::parse_bias_judge(&result.response));
+            }
+            LlmPoll::Failed => {
+                // Judge failure is non-critical — deterministic checks
+                // still stand. Surface the error as a single failed result
+                // so the UI shows something.
+                let err_msg = self
+                    .bias_judge_task
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Judge call failed".to_owned());
+                self.bias_judge_results = Some(vec![eval::ResponseValidation {
+                    rule: "JUDGE_ERROR".to_owned(),
+                    pass: false,
+                    reason: err_msg,
+                }]);
+            }
+            LlmPoll::Pending | LlmPoll::Idle => {}
         }
     }
 
@@ -2131,6 +2249,14 @@ impl DashboardApp {
             .storage
             .load_recent_inferences(20)
             .unwrap_or_default();
+        self.reload_folds_status_map();
+    }
+
+    fn reload_folds_status_map(&mut self) {
+        self.folds_status_by_inference = self
+            .storage
+            .load_folds_status_by_inference()
+            .unwrap_or_default();
     }
 
     // -- Phase 2: Report generation --
@@ -2160,6 +2286,7 @@ impl DashboardApp {
                     self.report_task.error = None;
                 }
                 self.report_inferences = inferences;
+                self.reload_folds_status_map();
             }
             Err(err) => {
                 self.report_task.error = Some(format!("Failed to load inferences: {err:#}"));
@@ -2315,12 +2442,164 @@ impl DashboardApp {
                     );
                 }
 
+                // Commodity-bias validation — shown after analysis completes
+                if self.ai_response.is_some() && !self.ai_task.in_flight {
+                    self.render_bias_validation(ui);
+                }
+
                 // 51Folds section — shown after a successful analysis
                 if self.ai_response.is_some() && !self.ai_task.in_flight {
                     self.render_folds_section(ui);
                 }
             });
         self.ai_panel_content_height = scroll_out.content_size.y;
+    }
+
+    /// Render the commodity-bias validation summary in the AI panel.
+    fn render_bias_validation(&self, ui: &mut egui::Ui) {
+        if self.bias_deterministic.is_empty() {
+            return;
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        // Combine deterministic + judge results for display.
+        let det_pass = self.bias_deterministic.iter().filter(|r| r.pass).count();
+        let det_total = self.bias_deterministic.len();
+
+        let judge_provider_label = self
+            .bias_judge_provider
+            .map(|p| match p {
+                LlmProvider::Anthropic => "Claude",
+                LlmProvider::OpenAI => "GPT",
+            })
+            .unwrap_or("");
+
+        let (judge_label, judge_results) = match &self.bias_judge_results {
+            None if self.bias_judge_task.in_flight => ("running...", None),
+            None => ("not run", None),
+            Some(results) => {
+                let pass = results.iter().filter(|r| r.pass).count();
+                let total = results.len();
+                ("", Some((pass, total, results)))
+            }
+        };
+
+        // Header line: "Bias Check: 3/3 deterministic | 5/5 judge"
+        ui.horizontal(|ui| {
+            let det_color = if det_pass == det_total {
+                ALERT_NORMAL_FG
+            } else {
+                ALERT_EXTREME_FG
+            };
+            ui.label(
+                RichText::new("Bias Check")
+                    .strong()
+                    .size(11.0)
+                    .color(TEXT_SECONDARY),
+            );
+            ui.label(
+                RichText::new(format!("{det_pass}/{det_total} structural"))
+                    .size(11.0)
+                    .color(det_color),
+            ).on_hover_text(
+                "Instant checks on the AI response:\n\
+                 \u{2022} Hypothesis names a selected instrument\n\
+                 \u{2022} No unselected instrument is the subject\n\
+                 \u{2022} Price levels match the latest closes"
+            );
+            ui.label(
+                RichText::new("|")
+                    .size(11.0)
+                    .color(TEXT_MUTED),
+            );
+            match judge_results {
+                Some((pass, total, _)) => {
+                    let judge_color = if pass == total {
+                        ALERT_NORMAL_FG
+                    } else {
+                        ALERT_EXTREME_FG
+                    };
+                    let label = if judge_provider_label.is_empty() {
+                        format!("{pass}/{total} semantic")
+                    } else {
+                        format!("{pass}/{total} semantic ({judge_provider_label})")
+                    };
+                    ui.label(
+                        RichText::new(label)
+                            .size(11.0)
+                            .color(judge_color),
+                    ).on_hover_text(
+                        "LLM judge validates the analysis semantically:\n\
+                         \u{2022} Subject match \u{2014} hypothesis is about the right instruments\n\
+                         \u{2022} Price anchoring \u{2014} prices from latest data, not training priors\n\
+                         \u{2022} Mechanism relevance \u{2014} causal logic specific to selected instruments\n\
+                         \u{2022} Tertiary boundary \u{2014} non-selected instruments stay as background\n\
+                         \u{2022} Outcome alignment \u{2014} outcomes have distinct causal paths"
+                    );
+                }
+                None => {
+                    let label = if self.bias_judge_task.in_flight && !judge_provider_label.is_empty() {
+                        format!("semantic via {judge_provider_label}...")
+                    } else {
+                        format!("semantic {judge_label}")
+                    };
+                    ui.label(
+                        RichText::new(label)
+                            .size(11.0)
+                            .color(TEXT_MUTED),
+                    );
+                    if self.bias_judge_task.in_flight {
+                        ui.spinner();
+                    }
+                }
+            }
+        });
+
+        // Show failures — truncated with ellipsis, full text in tooltip.
+        let all_results: Vec<&eval::ResponseValidation> = self
+            .bias_deterministic
+            .iter()
+            .chain(
+                self.bias_judge_results
+                    .as_ref()
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+                    .iter(),
+            )
+            .collect();
+
+        let failures: Vec<&&eval::ResponseValidation> =
+            all_results.iter().filter(|r| !r.pass).collect();
+
+        if !failures.is_empty() {
+            ui.add_space(2.0);
+            for r in failures {
+                let full_text = if r.reason.is_empty() {
+                    r.rule.clone()
+                } else {
+                    format!("{}: {}", r.rule, r.reason)
+                };
+                let truncated = if full_text.len() > 80 {
+                    format!("{}...", &full_text[..full_text.floor_char_boundary(77)])
+                } else {
+                    full_text.clone()
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("x")
+                            .size(10.0)
+                            .color(ALERT_EXTREME_FG),
+                    );
+                    ui.label(
+                        RichText::new(&truncated)
+                            .size(10.0)
+                            .color(TEXT_SECONDARY),
+                    ).on_hover_text(&full_text);
+                });
+            }
+        }
     }
 
     fn render_folds_section(&mut self, ui: &mut egui::Ui) {
@@ -4443,21 +4722,20 @@ impl DashboardApp {
 
                             ui.add_space(18.0);
 
-                            // Version pill — use a non-clickable Button so
-                            // it shrinks to content instead of stretching
-                            // across the card (the issue Frame::show had
-                            // in the previous layout).
+                            // Version pill — rendered as a Button with
+                            // generous padding so the text doesn't crowd
+                            // the border.
+                            ui.spacing_mut().button_padding = Vec2::new(36.0, 14.0);
                             let _ = ui.add(
                                 egui::Button::new(
                                     RichText::new("PREVIEW 0.1")
-                                        .size(11.0)
+                                        .size(13.0)
                                         .strong()
                                         .color(fade(ACCENT_BLUE)),
                                 )
                                 .fill(fade(PANEL_BG))
                                 .stroke(egui::Stroke::new(1.0, fade(BORDER)))
-                                .corner_radius(12.0)
-                                .min_size(Vec2::new(0.0, 24.0)),
+                                .corner_radius(16.0),
                             );
 
                             // ── Loading readout ────────────────────────
@@ -4601,6 +4879,7 @@ impl eframe::App for DashboardApp {
 
         self.poll_refresh();
         self.poll_ai();
+        self.poll_bias_judge();
         self.poll_outcomes_reroll();
         self.poll_report();
         self.poll_folds();
@@ -5091,7 +5370,13 @@ impl DashboardApp {
                                     };
                                     let short = inference_label_short(inf);
                                     let full = inference_label_full(inf);
+                                    let folds_badge = self.folds_status_by_inference.get(&inf.id);
                                     let display = truncate_with_ellipsis(&short, 50);
+                                    let hover = if let Some((mid, status)) = folds_badge {
+                                        format!("51Folds model {mid} — {status}\n\n{full}")
+                                    } else {
+                                        full
+                                    };
                                     ui.horizontal(|ui| {
                                         let (dot_rect, _) = ui.allocate_exact_size(
                                             Vec2::new(8.0, 8.0),
@@ -5102,6 +5387,26 @@ impl DashboardApp {
                                             4.0,
                                             level_color,
                                         );
+                                        // Fixed-width model badge column
+                                        let (badge_char, badge_color) = match folds_badge {
+                                            Some((_, status)) => match status.as_str() {
+                                                "success" => ("\u{25A0}", ALERT_NORMAL_FG),   // ■
+                                                "pending" => ("\u{25A0}", ACCENT_BLUE),
+                                                _ => ("\u{25A0}", ALERT_EXTREME_FG),
+                                            },
+                                            None => ("\u{25A1}", TEXT_MUTED),                  // □
+                                        };
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(12.0, 10.0),
+                                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(badge_char)
+                                                        .size(8.0)
+                                                        .color(badge_color),
+                                                );
+                                            },
+                                        );
                                         let resp = ui
                                             .add(
                                                 egui::Label::new(
@@ -5111,7 +5416,7 @@ impl DashboardApp {
                                                 )
                                                 .sense(Sense::click()),
                                             )
-                                            .on_hover_text(&full);
+                                            .on_hover_text(&hover);
                                         if resp.clicked() {
                                             load_inference = Some(inf.clone());
                                         }
@@ -5235,8 +5540,9 @@ impl DashboardApp {
                         return;
                     }
 
+                    let mut run_analysis = false;
                     if let Some(status) = &self.cached_vix_status {
-                        status_banner(ui, status);
+                        run_analysis = status_banner(ui, status, self.ai_task.in_flight);
                     }
 
                     ui.add_space(8.0);
@@ -5295,6 +5601,10 @@ impl DashboardApp {
                         self.correlation_collapsed = correlation_collapsed;
                         self.price_panel_collapsed = price_panel_collapsed;
                     });
+
+                    if run_analysis {
+                        self.start_ai_analysis();
+                    }
                 }
                 CentralView::Model => {
                     self.render_central_model_view(ui);
@@ -5454,6 +5764,7 @@ impl DashboardApp {
                                         _ => ALERT_NORMAL_FG,
                                     };
                                     let label = inference_label(inf);
+                                    let folds_badge = self.folds_status_by_inference.get(&inf.id);
                                     let resp = ui.horizontal(|ui| {
                                         let (dot_rect, _) = ui.allocate_exact_size(
                                             Vec2::new(10.0, 10.0),
@@ -5465,6 +5776,30 @@ impl DashboardApp {
                                             level_color,
                                         );
                                         ui.add_space(4.0);
+                                        // Fixed-width 51Folds model column
+                                        let (badge_text, badge_color, badge_tip) = match folds_badge {
+                                            Some((mid, status)) => {
+                                                let tip = format!("51Folds model {mid} — {status}");
+                                                match status.as_str() {
+                                                    "success" => (mid.clone(), ALERT_NORMAL_FG, tip),
+                                                    "pending" => (format!("{mid}.."), ACCENT_BLUE, tip),
+                                                    _ => (format!("{mid}!"), ALERT_EXTREME_FG, tip),
+                                                }
+                                            }
+                                            None => ("\u{2014}".to_owned(), TEXT_MUTED, "No 51Folds model for this inference".to_owned()),
+                                        };
+                                        let badge_resp = ui.allocate_ui_with_layout(
+                                            Vec2::new(36.0, 16.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(&badge_text)
+                                                        .size(11.0)
+                                                        .color(badge_color),
+                                                );
+                                            },
+                                        );
+                                        badge_resp.response.on_hover_text(&badge_tip);
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(label)
@@ -5569,7 +5904,7 @@ fn sidebar_vix_summary(ui: &mut egui::Ui, status: &VixStatus) {
 }
 
 fn sidebar_overlay_controls(ui: &mut egui::Ui, settings: &mut AppSettings) {
-    ui.heading("Compare Against VIX");
+    ui.heading("Overlay on VIX");
 
     let n = settings.overlay_instruments.len();
     ui.label(
@@ -6095,12 +6430,15 @@ fn empty_state_panel(ui: &mut egui::Ui, refreshing: bool) {
     });
 }
 
-fn status_banner(ui: &mut egui::Ui, status: &VixStatus) {
+/// Returns `true` when the user clicks the Analyze button in the banner.
+fn status_banner(ui: &mut egui::Ui, status: &VixStatus, ai_in_flight: bool) -> bool {
     let accent = match status.level {
         AlertLevel::Normal => ALERT_NORMAL_FG,
         AlertLevel::ApproachingExtreme => ALERT_APPROACHING_FG,
         AlertLevel::Extreme => ALERT_EXTREME_FG,
     };
+
+    let mut analyze_clicked = false;
 
     let outer = egui::Frame::default()
         .fill(SURFACE)
@@ -6126,6 +6464,31 @@ fn status_banner(ui: &mut egui::Ui, status: &VixStatus) {
                     .color(TEXT_SECONDARY)
                     .size(12.0),
                 );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ai_in_flight {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Analyzing...")
+                                .size(11.0)
+                                .color(TEXT_MUTED),
+                        );
+                    } else if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("Analyze")
+                                    .size(11.0)
+                                    .color(ACCENT_BLUE),
+                            )
+                            .fill(PANEL_BG)
+                            .stroke(egui::Stroke::new(1.0, ACCENT_BLUE_DIM))
+                            .corner_radius(4.0),
+                        )
+                        .on_hover_text("Run AI analysis on the current view")
+                        .clicked()
+                    {
+                        analyze_clicked = true;
+                    }
+                });
             });
         });
 
@@ -6136,6 +6499,8 @@ fn status_banner(ui: &mut egui::Ui, status: &VixStatus) {
         egui::CornerRadius::same(6),
         accent,
     );
+
+    analyze_clicked
 }
 
 // ---------------------------------------------------------------------------
@@ -6350,7 +6715,7 @@ fn chart_correlation(
         if custom_zoom.is_some() && !app.settings.overlay_instruments.is_empty() {
             "No commodity data available for this period."
         } else {
-            "Select assets in the sidebar to compare against VIX."
+            "Select assets in the sidebar under Overlay on VIX."
         }
     } else {
         ""
