@@ -40,7 +40,9 @@ The dashboard provides:
 - **Price panel** — press [P] to open a quick-pick panel for any individual instrument's raw price chart
 - **Spike episode detection** with clickable highlights
 - **Commodity-bias validation** — every AI analysis is automatically checked for instrument bias, price anchoring, and subject drift, both deterministically and via an LLM judge (cross-model when two API keys are present)
-- **Embedded research agent** — a Research Agent tab runs the Dexter financial research CLI in an embedded terminal, using your existing LLM keys
+- **Embedded research agent** — a Research Agent tab runs the Dexter financial research CLI in an embedded terminal, using your existing LLM keys. Type `/51folds` to synthesize your research into a structured hypothesis for 51Folds model creation
+- **Visual Map** — interactive D3.js DAG visualization of the 51Folds causal driver graph, rendered via an embedded WebView with hover highlighting and click-to-navigate
+- **Summary Report view** — inline central panel for loading inference histories and generating retrospective reports across date ranges
 - **Live data** — FRED for VIX, Alpha Vantage for all commodities including Soybeans (daily spot closes)
 - **Daily cache** — same-day re-launches reuse stored data so the API quota only burns once per trading day
 
@@ -214,12 +216,13 @@ All dependencies — including the 51Folds SDK — are either on crates.io or ve
 | Control | Function |
 |---------|----------|
 | Charts / 51Folds / Research | Switch the central panel between market charts, the model explorer, and the embedded research agent |
-| Outcome / Drivers | Sub-tabs within the 51Folds model explorer |
+| Outcome / Drivers / Visual Map | Sub-tabs within the 51Folds model explorer |
 | 1M / 3M / 6M / 1Y / All | Time window selection (Charts view only) |
 | Refresh | Fetch fresh data from all providers |
 | Save | Persist settings and API keys |
-| Report | Open the Summary Report window |
+| Report | Switch to the Summary Report view for loading inferences and generating reports |
 | Help | Open comprehensive documentation |
+| Analyze | Quick-launch AI analysis (shown in the VIX status banner on the Charts view) |
 
 ### Sidebar
 
@@ -241,13 +244,26 @@ All dependencies — including the 51Folds SDK — are either on crates.io or ve
 
 ### 51Folds Model Workflow
 
-1. Click **Analyze Current View** in the AI Analysis sidebar section
+There are two paths to creating a 51Folds model:
+
+**From AI Analysis (Charts view):**
+1. Click **Analyze** on the VIX status banner (or use the sidebar button)
 2. The LLM produces a regime classification and a structured hypothesis with outcomes
 3. Review and optionally edit the hypothesis, or click **Different outcomes** for alternatives
 4. Click **Create 51Folds Model** — the model builds in ~25-30 minutes
 5. When complete, the central panel auto-switches to the **Outcome** tab showing probability bars
-6. Switch to the **Drivers** tab to explore causal factors and run scenario analysis
-7. Loading a saved inference from the sidebar history will restore its linked model if one exists
+
+**From Research Agent (Dexter terminal):**
+1. Do your research in the Research Agent terminal — ask questions, explore data
+2. Type `/51folds` to synthesize the conversation into a hypothesis, or `/51folds focus on the bear case` to steer the angle
+3. The hypothesis is written to the database and the sidebar populates automatically
+4. Click **Create 51Folds Model** — same flow from here
+
+**Exploring a completed model:**
+- **Outcome** tab — probability bars for each outcome with deltas after re-evaluation
+- **Drivers** tab — causal drivers with state pill selectors, click Details for full context
+- **Visual Map** tab — interactive DAG showing the causal network; hover to highlight connections, click a node to navigate to its driver detail page
+- Loading a saved inference from the sidebar history restores its linked model
 
 ## Data Sources
 

@@ -287,30 +287,51 @@ The agent launches in an embedded terminal. You can interact with it directly �
 
 The Research Agent uses the provider configured in the sidebar under **Settings > Research Agent**. This is independent of the AI Analysis provider, so you can run analysis on Claude while the research agent uses GPT (or vice versa).
 
+### /51folds command
+
+After doing research in the terminal, type `/51folds` to synthesize the conversation into a structured 51Folds hypothesis. The agent takes the full conversation context, generates a hypothesis with outcomes and driver context, and writes it directly to the Hedgehog's database. The sidebar populates automatically — no manual copy-paste needed.
+
+You can add a directional prompt to steer the hypothesis focus:
+
+- `/51folds` — synthesize from the full conversation, agent decides the angle
+- `/51folds focus on the bear case around margin compression` — conversation context plus your specific direction shapes the hypothesis
+
+The hypothesis appears in the sidebar under **Research Analysis** and is ready for 51Folds model creation, the same as an AI Analysis hypothesis. The sidebar header changes between "AI Analysis" and "Research Analysis" depending on the source.
+
 ---
 
 ## 51Folds Model Explorer
 
-After an AI Analysis produces a hypothesis, the app can submit it to **51Folds** — a Bayesian modelling service that builds a causal-driver model and returns probability-weighted outcomes plus a full driver graph. The Hedgehog ships with the 51Folds Rust SDK integrated directly: enter your `FOLDS_API_KEY` in `.env`, run an analysis, and the hypothesis editor appears in the right-hand AI panel.
+After an AI Analysis or Research Agent session produces a hypothesis, the app can submit it to **51Folds** — a Bayesian modelling service that builds a causal-driver model and returns probability-weighted outcomes plus a full driver graph. The Hedgehog ships with the 51Folds Rust SDK integrated directly: enter your `FOLDS_API_KEY` in `.env`, run an analysis (or use `/51folds` in the Research Agent), and the hypothesis editor appears in the sidebar.
 
 ### Creating a model
 
-1. Run an AI Analysis — the right-hand panel shows the regime assessment and a collapsible hypothesis editor
-2. Review and edit the hypothesis, outcomes, and driver context fields (all four are optional — defaults come from the LLM)
-3. Click **Create 51Folds Model**
-4. The panel shows "Model ID: X — building…" while the model is under construction (typically 25–30 minutes for the Advanced tier)
-5. When the model completes, the sidebar summary switches to green **Model ID: X — complete** with the outcome probabilities listed below, and the central panel auto-switches from Charts to **51Folds**
+**From AI Analysis:**
+1. Click **Analyze** on the VIX status banner or in the sidebar
+2. The right-hand panel shows the regime assessment and a collapsible hypothesis editor
+3. Review and edit the hypothesis, outcomes, and driver context fields
+4. Click **Create 51Folds Model**
+
+**From Research Agent:**
+1. Do your research in the Dexter terminal
+2. Type `/51folds` (optionally with a directional prompt)
+3. The hypothesis populates the sidebar automatically
+4. Click **Create 51Folds Model**
+
+In both cases, the panel shows "Model ID: X — building…" while the model is under construction (typically 25–30 minutes for the Advanced tier). When the model completes, the sidebar summary switches to green **Model ID: X — complete** with the outcome probabilities listed below, and the central panel auto-switches from Charts to **51Folds**.
 
 Models persist across restarts. If you close the app while a model is building, the resume sweep will re-attach the polling thread on next launch and update the sidebar once the SDK reports completion (or gives up after 35 minutes).
 
-### Charts vs 51Folds tabs
+### Central panel views
 
-The central panel has two top-level views selectable from the sub-toolbar:
+The central panel has several top-level views selectable from the toolbar:
 
-- **Charts** — VIX time series, asset-performance-vs-VIX comparison chart, optional price panel (press `[P]`). This is what you see before running any AI analysis.
+- **Charts** — VIX time series, asset-performance-vs-VIX comparison chart, optional price panel (press `[P]`). This is the default view.
 - **51Folds** — the Model Explorer. Disabled (greyed) until a model has been completed for the current inference. The label turns blue once a model is available.
+- **Research Agent** — embedded Dexter terminal for conversational financial research.
+- **Report** — Summary Report view for loading inference histories and generating retrospective reports.
 
-Inside the 51Folds tab there are two sub-views selectable from the sub-toolbar: **Outcome** and **Drivers**.
+Inside the 51Folds tab there are three sub-views selectable from the sub-toolbar: **Outcome**, **Drivers**, and **Visual Map**.
 
 ### Outcome view
 
@@ -376,19 +397,32 @@ Drivers ─→ DriverDetail ─→ DriverSection
          Back buttons
 ```
 
-The Outcome and Drivers top-level views are reachable from the sub-toolbar at any time.
+### Visual Map
+
+The Visual Map tab shows an interactive directed acyclic graph (DAG) of the model's causal network, rendered via D3.js and dagre in an embedded WebView.
+
+- **Nodes** — each driver appears as a gold circle with its abbreviated code. The Outcome node is red and sits at the bottom of the graph.
+- **Edges** — straight lines showing causal relationships between drivers, converging toward the Outcome node.
+- **Hover** — hovering over a node highlights its direct connections in blue. The path from that node to the Outcome highlights in red. All unconnected nodes and edges dim.
+- **Click** — clicking a node navigates to its driver detail page. A back button labelled "Visual Map" returns you to the graph.
+- **Pan and zoom** — drag to pan, scroll to zoom.
+
+The Visual Map updates automatically when driver states change (pill edits on the Drivers tab) or after a re-evaluation completes.
+
+The Outcome, Drivers, and Visual Map views are reachable from the sub-toolbar at any time.
 
 ---
 
 ## Summary Reports
 
-The **Report** button in the top bar opens a window for generating retrospective summaries across multiple saved analyses.
+The **Report** button in the toolbar switches the central panel to the Summary Report view for generating retrospective summaries across multiple saved analyses. This includes both AI Analysis and Research Agent inferences.
 
 ### Workflow
 1. Set a date range using the **From** / **To** fields, or click a preset button (Last 7 days, Last 30 days, Last 90 days, All)
 2. Click **Load Inferences** to fetch all saved analyses in that range
-3. Browse the loaded list — each entry shows its timestamp, type (Analysis or Report), VIX reading, and a preview. Click any entry to view its full response in the AI panel.
+3. Browse the loaded list — each entry shows its timestamp, source (Analysis or Report), VIX reading, 51Folds model badge, and hypothesis preview. Hover for full text; click to load the inference into the sidebar.
 4. Click **Generate Report** to send all loaded analyses to the LLM for synthesis
+5. Click **Load Inferences** again to clear a generated report and return to the inference list
 
 ### What the report covers
 The LLM receives every analysis from the selected period and produces a structured report with:
