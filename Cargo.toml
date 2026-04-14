@@ -20,6 +20,7 @@ egui_commonmark = "0.20"
 uuid = { version = "1", features = ["v4"] }
 fiftyone-folds = { path = "vendor/fiftyone-folds" }
 tokio = { version = "1", features = ["rt", "time"] }
+egui_term = "0.1.0"
 
 # The profile that 'dist' will build with
 [profile.dist]

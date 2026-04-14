@@ -392,12 +392,39 @@ pub fn resume_poll(
     db_path: PathBuf,
     created_at: DateTime<Utc>,
 ) {
+    resume_poll_inner(api_key, model_id, db_path, created_at, None);
+}
+
+/// Like `resume_poll`, but sends progress through a channel so the UI can
+/// show a spinner and model ID while the build completes. Used for the most
+/// recent pending model on startup; the others use the fire-and-forget
+/// `resume_poll` which writes directly to the DB.
+pub fn resume_poll_ui(
+    api_key: String,
+    model_id: String,
+    db_path: PathBuf,
+    created_at: DateTime<Utc>,
+    tx: Sender<FoldsResult>,
+) {
+    resume_poll_inner(api_key, model_id, db_path, created_at, Some(tx));
+}
+
+fn resume_poll_inner(
+    api_key: String,
+    model_id: String,
+    db_path: PathBuf,
+    created_at: DateTime<Utc>,
+    tx: Option<Sender<FoldsResult>>,
+) {
     let rt = build_runtime();
     rt.block_on(async {
         let client = match build_client(&api_key) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("warn: resume poll for {model_id} failed to build client: {e}");
+                if let Some(tx) = tx {
+                    let _ = tx.send(FoldsResult::Failed(format!("{e}")));
+                }
                 return;
             }
         };
@@ -415,6 +442,11 @@ pub fn resume_poll(
                 FOLDS_STATUS_UNDISCLOSED_FAILURE,
                 Some(Utc::now()),
             );
+            if let Some(tx) = tx {
+                let _ = tx.send(FoldsResult::Failed(
+                    format!("Model {model_id} exceeded 35-minute build ceiling"),
+                ));
+            }
             return;
         }
 
@@ -430,6 +462,9 @@ pub fn resume_poll(
         {
             Ok(model) => {
                 persist_completed(&db_path, &model_id, &model);
+                if let Some(tx) = tx {
+                    let _ = tx.send(FoldsResult::Completed(Box::new(model)));
+                }
             }
             Err(FoldsError::ModelBuildFailed { model_id: mid, .. }) => {
                 storage::update_folds_model_status_standalone(
@@ -438,6 +473,9 @@ pub fn resume_poll(
                     FOLDS_STATUS_FAIL,
                     Some(Utc::now()),
                 );
+                if let Some(tx) = tx {
+                    let _ = tx.send(FoldsResult::Failed(format!("Model {mid} build failed")));
+                }
             }
             Err(FoldsError::PollTimeout { .. }) => {
                 storage::update_folds_model_status_standalone(
@@ -446,9 +484,17 @@ pub fn resume_poll(
                     FOLDS_STATUS_UNDISCLOSED_FAILURE,
                     Some(Utc::now()),
                 );
+                if let Some(tx) = tx {
+                    let _ = tx.send(FoldsResult::Failed(
+                        format!("Model {model_id} timed out"),
+                    ));
+                }
             }
             Err(e) => {
                 eprintln!("warn: resume poll for {model_id} failed: {e}");
+                if let Some(tx) = tx {
+                    let _ = tx.send(FoldsResult::Failed(format!("{e}")));
+                }
             }
         }
     });

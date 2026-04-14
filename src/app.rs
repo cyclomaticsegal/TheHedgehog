@@ -50,6 +50,7 @@ const MAX_LOG_ENTRIES: usize = 500;
 enum CentralView {
     Charts,
     Model,
+    ResearchAgent,
 }
 
 /// Navigation stack within the 51Folds model explorer. Each variant is
@@ -438,6 +439,33 @@ impl FoldsTask {
     }
 }
 
+/// State for the embedded Dexter research-agent terminal.
+struct ResearchTerminal {
+    backend: Option<egui_term::TerminalBackend>,
+    pty_rx: Option<std::sync::mpsc::Receiver<(u64, egui_term::PtyEvent)>>,
+    /// Whether `bun` was found in PATH. `None` = not yet checked.
+    bun_available: Option<bool>,
+    /// If the child process exited, stores the exit code.
+    child_exited: Option<i32>,
+    /// Human-readable error (backend creation failure, missing key, etc.).
+    error: Option<String>,
+    /// Monotonically increasing ID for terminal backend instances.
+    next_id: u64,
+}
+
+impl ResearchTerminal {
+    fn new() -> Self {
+        Self {
+            backend: None,
+            pty_rx: None,
+            bun_available: None,
+            child_exited: None,
+            error: None,
+            next_id: 1,
+        }
+    }
+}
+
 pub struct DashboardApp {
     storage: Storage,
     settings: AppSettings,
@@ -524,6 +552,10 @@ pub struct DashboardApp {
     /// If set, a modal confirmation is asking the user to approve
     /// reverting to the original (from the DB baseline).
     revert_to_original_confirm: bool,
+    /// Embedded Dexter terminal state (lazy-initialized on first tab switch).
+    research_terminal: ResearchTerminal,
+    /// Cached egui Context for TerminalBackend creation outside update().
+    egui_ctx: egui::Context,
 }
 
 /// Mascot PNG embedded at compile time (transparent background — chosen
@@ -942,6 +974,8 @@ impl DashboardApp {
             mascot_texture: None,
             reeval_toast_until: None,
             revert_to_original_confirm: false,
+            research_terminal: ResearchTerminal::new(),
+            egui_ctx: _cc.egui_ctx.clone(),
         };
 
         // Skip data loading and auto-refresh if the database couldn't be opened;
@@ -1004,13 +1038,10 @@ impl DashboardApp {
                 .load_observations(instrument)
                 .unwrap_or_else(|e| { eprintln!("warn: {e}"); Vec::new() });
 
-            // Filter by source (VIX and Soybeans from FRED, commodities from Alpha Vantage)
+            // Filter by source (VIX from FRED, all commodities from Alpha Vantage)
             if instrument == Instrument::Vix {
                 observations.retain(|o| o.source == "FRED VIXCLS");
-            } else if instrument == Instrument::Soybeans {
-                observations.retain(|o| o.source == "FRED PSOYBUSDM");
             } else {
-                // All other commodities use Alpha Vantage
                 observations.retain(|o| o.source.starts_with("Alpha Vantage"));
             }
 
@@ -1076,6 +1107,113 @@ impl DashboardApp {
         Ok(())
     }
 
+    /// Spawn (or re-spawn) the Dexter research agent in an embedded PTY terminal.
+    fn spawn_research_terminal(&mut self) {
+        self.research_terminal.child_exited = None;
+        self.research_terminal.error = None;
+        self.research_terminal.backend = None;
+        self.research_terminal.pty_rx = None;
+
+        let provider = self.settings.research_provider;
+        let api_key = self.api_keys.ai_key_for(provider).trim().to_owned();
+
+        if api_key.is_empty() {
+            self.research_terminal.error = Some(format!(
+                "No API key for {}. Configure it in Settings → Research Agent.",
+                provider.label(),
+            ));
+            return;
+        }
+
+        let dexter_dir = self
+            .env_path
+            .parent()
+            .map(|p| p.join("vendor").join("dexter"))
+            .unwrap_or_else(|| PathBuf::from("vendor/dexter"));
+
+        let env_key_name = match provider {
+            LlmProvider::Anthropic => "ANTHROPIC_API_KEY",
+            LlmProvider::OpenAI => "OPENAI_API_KEY",
+        };
+
+        // Build env exports: LLM key + any Dexter-specific data source keys
+        // present in the environment.
+        let mut exports = format!("export {env_key_name}='{api_key}'");
+        let passthrough_keys = [
+            "FINANCIAL_DATASETS_API_KEY",
+            "EXASEARCH_API_KEY",
+            "PERPLEXITY_API_KEY",
+            "TAVILY_API_KEY",
+            "X_BEARER_TOKEN",
+        ];
+        for key in passthrough_keys {
+            if let Ok(val) = std::env::var(key) {
+                if !val.is_empty() {
+                    exports.push_str(&format!(" && export {key}='{val}'"));
+                }
+            }
+        }
+
+        let settings = egui_term::BackendSettings {
+            shell: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("{exports} && exec bun run start"),
+            ],
+            working_directory: Some(dexter_dir),
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let id = self.research_terminal.next_id;
+        self.research_terminal.next_id += 1;
+
+        match egui_term::TerminalBackend::new(id, self.egui_ctx.clone(), tx, settings) {
+            Ok(backend) => {
+                self.research_terminal.backend = Some(backend);
+                self.research_terminal.pty_rx = Some(rx);
+            }
+            Err(e) => {
+                self.research_terminal.error =
+                    Some(format!("Failed to start terminal: {e}"));
+            }
+        }
+    }
+
+    /// Drain PTY events for the research terminal.
+    fn poll_research_terminal(&mut self) {
+        let Some(ref rx) = self.research_terminal.pty_rx else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok((_id, event)) => match event {
+                    egui_term::PtyEvent::ChildExit(code) => {
+                        self.research_terminal.child_exited = Some(code);
+                        self.research_terminal.backend = None;
+                        self.research_terminal.pty_rx = None;
+                        return;
+                    }
+                    egui_term::PtyEvent::Exit => {
+                        self.research_terminal.child_exited = Some(0);
+                        self.research_terminal.backend = None;
+                        self.research_terminal.pty_rx = None;
+                        return;
+                    }
+                    _ => {}
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if self.research_terminal.child_exited.is_none() {
+                        self.research_terminal.child_exited = Some(-1);
+                    }
+                    self.research_terminal.backend = None;
+                    self.research_terminal.pty_rx = None;
+                    return;
+                }
+            }
+        }
+    }
+
     fn start_refresh(&mut self) {
         if self.refresh_in_flight {
             return;
@@ -1109,8 +1247,8 @@ impl DashboardApp {
         // commodity, so a same-day re-fetch adds nothing).
         let mut cached_dates_alpha = std::collections::HashMap::new();
         for &instrument in &Instrument::ALL {
-            if instrument == Instrument::Vix || instrument == Instrument::Soybeans {
-                continue; // FRED-only instruments
+            if instrument == Instrument::Vix {
+                continue; // FRED-only instrument
             }
             if let Ok(Some(date)) = self
                 .storage
@@ -1125,12 +1263,6 @@ impl DashboardApp {
             .last_observation_date_for_provider(Instrument::Vix, "FRED VIXCLS")
         {
             cached_dates_fred.insert(Instrument::Vix, date);
-        }
-        if let Ok(Some(date)) = self
-            .storage
-            .last_observation_date_for_provider(Instrument::Soybeans, "FRED PSOYBUSDM")
-        {
-            cached_dates_fred.insert(Instrument::Soybeans, date);
         }
 
         let (tx, rx) = mpsc::channel();
@@ -1565,6 +1697,17 @@ impl DashboardApp {
         self.parsed_hypothesis = hypothesis.clone();
         self.draft_hypothesis = hypothesis;
         self.last_inference_id = Some(inf.id);
+
+        // Preserve in-flight build state across the reset — loading a
+        // historical inference should not kill a running model build.
+        // The toolbar spinner and central-view progress depend on these
+        // fields staying alive; when the build completes, poll_folds
+        // will auto-switch to the new model regardless of what's
+        // currently displayed.
+        let stashed_in_flight = self.folds_task.in_flight;
+        let stashed_rx = self.folds_task.rx.take();
+        let stashed_reevaluating = self.folds_task.reevaluating;
+
         // Clear previous folds_task, then try to load the linked model
         // from the database so completed models appear immediately.
         self.folds_task.reset();
@@ -1592,6 +1735,14 @@ impl DashboardApp {
                 self.start_folds_refresh();
             }
         }
+        // Restore in-flight build state so the toolbar spinner stays
+        // alive and poll_main can still receive the completion event.
+        if stashed_in_flight {
+            self.folds_task.in_flight = true;
+            self.folds_task.rx = stashed_rx;
+            self.folds_task.reevaluating = stashed_reevaluating;
+        }
+
         self.outcomes_task = LlmTask::new();
         self.ai_response = Some(inf.response);
         self.ai_task.error = None;
@@ -1861,7 +2012,12 @@ impl DashboardApp {
     ///
     /// - elapsed > 35 min → mark `undisclosed_failure` immediately
     /// - elapsed > 25 min → still poll, but count as "suspect"
-    /// - otherwise → spawn a background polling thread (DB-only, no UI)
+    /// - otherwise → spawn a background polling thread
+    ///
+    /// The **most recent** pending model (by `created_at`) is routed through
+    /// `FoldsTask` so the toolbar spinner and central model view show
+    /// build-in-progress. All other pending models use the fire-and-forget
+    /// DB-only path.
     fn resume_pending_folds_models(&mut self) {
         let api_key = self.api_keys.folds.trim().to_owned();
         if api_key.is_empty() {
@@ -1885,7 +2041,18 @@ impl DashboardApp {
         let mut marked_failure = 0usize;
         let db_path = database_path();
 
-        for record in pending {
+        // Find the most recent pending model that isn't expired —
+        // this one gets routed through FoldsTask for UI visibility.
+        let ui_candidate_idx = pending
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, r)| {
+                (now - r.created_at).num_seconds() < crate::models::FOLDS_UNDISCLOSED_AFTER_SECS
+            })
+            .map(|(i, _)| i);
+
+        for (i, record) in pending.iter().enumerate() {
             let elapsed_secs = (now - record.created_at).num_seconds();
             if elapsed_secs >= crate::models::FOLDS_UNDISCLOSED_AFTER_SECS {
                 if let Err(e) = self.storage.update_folds_model_status(
@@ -1910,14 +2077,34 @@ impl DashboardApp {
             let db_path_c = db_path.clone();
             let model_id_c = record.model_id.clone();
             let created_at_c = record.created_at;
-            thread::spawn(move || {
-                crate::folds::resume_poll(
-                    api_key_c,
-                    model_id_c,
-                    db_path_c,
-                    created_at_c,
-                );
-            });
+
+            if Some(i) == ui_candidate_idx {
+                // Route through FoldsTask so the UI shows progress.
+                let (tx, rx) = mpsc::channel();
+                self.folds_task.reset();
+                self.folds_task.model_id = Some(model_id_c.clone());
+                self.folds_task.in_flight = true;
+                self.folds_task.rx = Some(rx);
+                thread::spawn(move || {
+                    crate::folds::resume_poll_ui(
+                        api_key_c,
+                        model_id_c,
+                        db_path_c,
+                        created_at_c,
+                        tx,
+                    );
+                });
+            } else {
+                // Background DB-only poll.
+                thread::spawn(move || {
+                    crate::folds::resume_poll(
+                        api_key_c,
+                        model_id_c,
+                        db_path_c,
+                        created_at_c,
+                    );
+                });
+            }
             resumed += 1;
         }
 
@@ -2793,8 +2980,152 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
     }
 
     /// Render the 51Folds model explorer in the central panel.
+    fn render_research_agent_panel(&mut self, ui: &mut egui::Ui) {
+        // Lazy bun check (once).
+        if self.research_terminal.bun_available.is_none() {
+            let has_bun = std::process::Command::new("bun")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            self.research_terminal.bun_available = Some(has_bun);
+        }
+
+        if self.research_terminal.bun_available == Some(false) {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.label(
+                    RichText::new("Bun runtime not found")
+                        .size(18.0)
+                        .color(ALERT_APPROACHING_FG)
+                        .strong(),
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(
+                        "The Research Agent requires Bun to run.\n\
+                         Install it with: curl -fsSL https://bun.com/install | bash",
+                    )
+                    .size(13.0)
+                    .color(TEXT_SECONDARY),
+                );
+                ui.add_space(12.0);
+                if ui.button("Re-check").clicked() {
+                    self.research_terminal.bun_available = None;
+                }
+            });
+            return;
+        }
+
+        // Lazy terminal spawn on first visit.
+        if self.research_terminal.backend.is_none()
+            && self.research_terminal.child_exited.is_none()
+            && self.research_terminal.error.is_none()
+        {
+            self.spawn_research_terminal();
+        }
+
+        // Error state.
+        if let Some(ref err) = self.research_terminal.error {
+            let err = err.clone();
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                ui.label(
+                    RichText::new("Research Agent Error")
+                        .size(18.0)
+                        .color(ALERT_EXTREME_FG)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new(&err).size(13.0).color(TEXT_SECONDARY));
+                ui.add_space(12.0);
+                if ui.button("Retry").clicked() {
+                    self.spawn_research_terminal();
+                }
+            });
+            return;
+        }
+
+        // Child exited state.
+        if let Some(code) = self.research_terminal.child_exited {
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                let msg = if code == 0 {
+                    "Research Agent exited normally."
+                } else {
+                    "Research Agent exited unexpectedly."
+                };
+                ui.label(
+                    RichText::new(msg)
+                        .size(16.0)
+                        .color(if code == 0 {
+                            ALERT_NORMAL_FG
+                        } else {
+                            ALERT_APPROACHING_FG
+                        })
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("Exit code: {code}"))
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(12.0);
+                if ui.button("Restart").clicked() {
+                    self.spawn_research_terminal();
+                }
+            });
+            return;
+        }
+
+        // Render terminal widget.
+        if let Some(ref mut backend) = self.research_terminal.backend {
+            let available = ui.available_size();
+            let terminal_view = egui_term::TerminalView::new(ui, backend)
+                .set_focus(true)
+                .set_size(available)
+                .set_theme(hedgehog_terminal_theme());
+            ui.add(terminal_view);
+        }
+    }
+
     fn render_central_model_view(&mut self, ui: &mut egui::Ui) {
         if !self.folds_task.is_complete() {
+            // ── Build in progress — show spinner + model ID ───────
+            if self.folds_task.in_flight {
+                ui.add_space(80.0);
+                ui.vertical_centered(|ui| {
+                    ui.spinner();
+                    ui.add_space(10.0);
+                    let model_id = self.folds_task.model_id.clone().unwrap_or_default();
+                    let label = if self.folds_task.reevaluating {
+                        "Re-evaluating model\u{2026}".to_owned()
+                    } else if model_id.is_empty() {
+                        "Submitting to 51Folds\u{2026}".to_owned()
+                    } else {
+                        format!("Building model {model_id}\u{2026}")
+                    };
+                    ui.label(
+                        RichText::new(label)
+                            .size(16.0)
+                            .color(Color32::WHITE),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "This typically takes 25\u{2013}30 minutes. \
+                             You can navigate away \u{2014} the build continues in the background.",
+                        )
+                        .size(13.0)
+                        .color(TEXT_SECONDARY),
+                    );
+                });
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+
             // Two empty states: genuinely no model loaded, or we have
             // a `model_id` in memory but the model itself is stub /
             // unloadable. The second case is a recovery scenario —
@@ -4273,6 +4604,10 @@ impl eframe::App for DashboardApp {
         self.poll_outcomes_reroll();
         self.poll_report();
         self.poll_folds();
+        self.poll_research_terminal();
+        if self.folds_task.in_flight {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
         sanitize_overlay_selection(&mut self.settings);
         self.refresh_analysis_cache();
 
@@ -4439,6 +4774,14 @@ impl DashboardApp {
                     RichText::new("51Folds")
                 };
                 ui.selectable_value(&mut self.central_view, CentralView::Model, model_label);
+                if self.folds_task.in_flight && !self.folds_task.reevaluating {
+                    ui.spinner();
+                }
+                ui.selectable_value(
+                    &mut self.central_view,
+                    CentralView::ResearchAgent,
+                    "Research Agent",
+                );
                 ui.separator();
 
                 // Chart-specific controls (only when Charts tab is active)
@@ -4789,6 +5132,72 @@ impl DashboardApp {
                             }
                         });
 
+                    egui::CollapsingHeader::new("Research Agent")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("LLM Provider")
+                                    .size(11.0)
+                                    .color(TEXT_MUTED),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.settings.research_provider,
+                                    LlmProvider::Anthropic,
+                                    "Claude",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.research_provider,
+                                    LlmProvider::OpenAI,
+                                    "GPT",
+                                );
+                            });
+                            ui.add_space(4.0);
+                            match self.settings.research_provider {
+                                LlmProvider::Anthropic => {
+                                    api_key_field(
+                                        ui,
+                                        "Anthropic API Key",
+                                        &mut self.api_keys.anthropic,
+                                    );
+                                }
+                                LlmProvider::OpenAI => {
+                                    api_key_field(
+                                        ui,
+                                        "OpenAI API Key",
+                                        &mut self.api_keys.openai,
+                                    );
+                                }
+                            }
+                            ui.add_space(4.0);
+                            if let Some(code) = self.research_terminal.child_exited {
+                                ui.label(
+                                    RichText::new(format!("Dexter exited (code {code})"))
+                                        .size(11.0)
+                                        .color(ALERT_APPROACHING_FG),
+                                );
+                                if ui.button("Restart").clicked() {
+                                    self.spawn_research_terminal();
+                                }
+                            } else if self.research_terminal.backend.is_some() {
+                                ui.label(
+                                    RichText::new("Running")
+                                        .size(11.0)
+                                        .color(ALERT_NORMAL_FG),
+                                );
+                                if ui.button("Restart").clicked() {
+                                    self.spawn_research_terminal();
+                                }
+                            }
+                            if let Some(ref err) = self.research_terminal.error {
+                                ui.label(
+                                    RichText::new(err)
+                                        .size(11.0)
+                                        .color(ALERT_EXTREME_FG),
+                                );
+                            }
+                        });
+
                     let threshold_config_before = self.settings.threshold_config.clone();
                     ui.collapsing("Thresholds", |ui| {
                         sidebar_threshold_controls(ui, &mut self.settings);
@@ -4889,6 +5298,9 @@ impl DashboardApp {
                 }
                 CentralView::Model => {
                     self.render_central_model_view(ui);
+                }
+                CentralView::ResearchAgent => {
+                    self.render_research_agent_panel(ui);
                 }
             }
         });
@@ -6592,6 +7004,41 @@ fn instrument_color(instrument: Instrument) -> Color32 {
 
 /// Update or insert key=value pairs in `.env` file content, preserving all
 /// other lines (comments, blank lines, unrelated variables).
+/// Terminal color palette matching The Hedgehog's dark UI.
+fn hedgehog_terminal_theme() -> egui_term::TerminalTheme {
+    let palette = egui_term::ColorPalette {
+        background: String::from("#111827"), // PANEL_BG
+        foreground: String::from("#e2e8f0"), // TEXT_PRIMARY
+        black: String::from("#0a0e1a"),      // APP_BG
+        red: String::from("#e53e3e"),        // ALERT_EXTREME_FG
+        green: String::from("#38a169"),       // ALERT_NORMAL_FG
+        yellow: String::from("#d69e2e"),      // ALERT_APPROACHING_FG
+        blue: String::from("#60a5fa"),        // ACCENT_BLUE
+        magenta: String::from("#aa759f"),
+        cyan: String::from("#75b5aa"),
+        white: String::from("#e2e8f0"),       // TEXT_PRIMARY
+        bright_black: String::from("#4a5568"), // TEXT_MUTED
+        bright_red: String::from("#fc8181"),
+        bright_green: String::from("#68d391"),
+        bright_yellow: String::from("#feca88"),
+        bright_blue: String::from("#82b8c8"),
+        bright_magenta: String::from("#c28cb8"),
+        bright_cyan: String::from("#93d3c3"),
+        bright_white: String::from("#f8f8f8"),
+        bright_foreground: None,
+        dim_foreground: String::from("#94a3b8"), // TEXT_SECONDARY
+        dim_black: String::from("#0a0e1a"),
+        dim_red: String::from("#712b2b"),
+        dim_green: String::from("#5f6f3a"),
+        dim_yellow: String::from("#a17e4d"),
+        dim_blue: String::from("#456877"),
+        dim_magenta: String::from("#704d68"),
+        dim_cyan: String::from("#4d7770"),
+        dim_white: String::from("#8e8e8e"),
+    };
+    egui_term::TerminalTheme::new(Box::new(palette))
+}
+
 fn update_env_content(content: &str, updates: &[(&str, &str)]) -> String {
     let mut lines: Vec<String> = content.lines().map(|l| l.to_owned()).collect();
     for &(key, value) in updates {

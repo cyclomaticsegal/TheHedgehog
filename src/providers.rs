@@ -38,7 +38,7 @@ pub fn refresh_market_data(
 
     let today = chrono::Local::now().date_naive();
 
-    // Fetch from FRED (VIX + Soybeans)
+    // Fetch from FRED (VIX)
     for spec in build_specs_fred() {
         if let Some(&cached_date) = cached_dates_fred.get(&spec.instrument) {
             if cached_date == today {
@@ -152,18 +152,19 @@ fn build_specs_fred() -> Vec<ProviderSpec> {
                 series_id: "VIXCLS",
             },
         },
-        ProviderSpec {
-            instrument: Instrument::Soybeans,
-            source: "FRED PSOYBUSDM",
-            kind: ProviderKind::Fred {
-                series_id: "PSOYBUSDM",
-            },
-        },
     ]
 }
 
 fn build_specs_alpha_vantage() -> Vec<ProviderSpec> {
     vec![
+        ProviderSpec {
+            instrument: Instrument::Soybeans,
+            source: "Alpha Vantage SOYBEANS",
+            kind: ProviderKind::AlphaCommodity {
+                function: "SOYBEANS",
+                interval: "daily",
+            },
+        },
         ProviderSpec {
             instrument: Instrument::Gold,
             source: "Alpha Vantage GOLD",
@@ -203,7 +204,7 @@ fn build_specs_alpha_vantage() -> Vec<ProviderSpec> {
             source: "Alpha Vantage COPPER",
             kind: ProviderKind::AlphaCommodity {
                 function: "COPPER",
-                interval: "monthly",
+                interval: "daily",
             },
         },
         ProviderSpec {
@@ -211,7 +212,7 @@ fn build_specs_alpha_vantage() -> Vec<ProviderSpec> {
             source: "Alpha Vantage ALUMINUM",
             kind: ProviderKind::AlphaCommodity {
                 function: "ALUMINUM",
-                interval: "monthly",
+                interval: "daily",
             },
         },
         ProviderSpec {
@@ -219,7 +220,7 @@ fn build_specs_alpha_vantage() -> Vec<ProviderSpec> {
             source: "Alpha Vantage WHEAT",
             kind: ProviderKind::AlphaCommodity {
                 function: "WHEAT",
-                interval: "monthly",
+                interval: "daily",
             },
         },
         ProviderSpec {
@@ -227,7 +228,7 @@ fn build_specs_alpha_vantage() -> Vec<ProviderSpec> {
             source: "Alpha Vantage CORN",
             kind: ProviderKind::AlphaCommodity {
                 function: "CORN",
-                interval: "monthly",
+                interval: "daily",
             },
         },
     ]

@@ -293,7 +293,7 @@ what you're saying about the primary instruments. Never make them the subject. I
 weight, omit them.
 
 GROUND TRUTH RULE: The 'Latest close' values in the user message are authoritative. They come directly from \
-FRED (VIX, Soybeans) and Alpha Vantage (all other commodities) and are dated. You MUST use them as the current \
+FRED (VIX) and Alpha Vantage (all commodities including Soybeans) and are dated. You MUST use them as the current \
 price level for every numeric claim — strike prices in your hypothesis, level references in your context, the \
 '$X' figures in your outcome bands. Do NOT substitute prices from your training data. Do NOT round them to \
 historically familiar figures. If your training prior says gold is around $2,000 but the user message says \

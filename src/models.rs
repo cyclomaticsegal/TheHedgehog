@@ -301,6 +301,7 @@ pub struct AppSettings {
     pub ai_model_anthropic: String,
     pub ai_model_openai: String,
     pub ai_panel_dock: AiPanelDock,
+    pub research_provider: LlmProvider,
 }
 
 impl AppSettings {
@@ -334,6 +335,7 @@ impl Default for AppSettings {
             ai_model_anthropic: LlmProvider::Anthropic.default_model().to_owned(),
             ai_model_openai: LlmProvider::OpenAI.default_model().to_owned(),
             ai_panel_dock: AiPanelDock::Right,
+            research_provider: LlmProvider::default(),
         }
     }
 }

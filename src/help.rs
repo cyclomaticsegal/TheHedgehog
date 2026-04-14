@@ -63,8 +63,8 @@ When the VIX spikes, it signals that institutional investors are rapidly reprici
 
 The dashboard fetches live market data from two free API services:
 
-1. **FRED** (required for VIX and Soybeans) — Register at fred.stlouisfed.org, then find your API key under Account > API Keys. Free, generous rate limits.
-2. **Alpha Vantage** (required for all other commodities) — Get a free key at alphavantage.co/support/#api-key. Free tier: 25 requests/day, 1 request/second.
+1. **FRED** (required for VIX) — Register at fred.stlouisfed.org, then find your API key under Account > API Keys. Free, generous rate limits.
+2. **Alpha Vantage** (required for all commodities) — Get a free key at alphavantage.co/support/#api-key. Free tier: 25 requests/day, 1 request/second.
 
 Keys can be entered in the sidebar under **Data Source**, or stored in a `.env` file in the app directory:
 
@@ -93,7 +93,7 @@ Keys are loaded from `.env` on startup. You can also enter or update them in the
 
 - **Time Window Buttons** (1M, 3M, 6M, 1Y, All) — Select how much history to display. Clicking any button clears a custom zoom if one is active.
 - **Zoom Indicator** — When you have dragged to zoom on a chart, shows the zoom date range with a Reset button.
-- **Refresh** — Fetches fresh data from FRED (VIX, Soybeans) and Alpha Vantage (all other commodities). The daily-cache check skips API calls for instruments whose latest stored close is already today's, so back-to-back refreshes within a trading day are free.
+- **Refresh** — Fetches fresh data from FRED (VIX) and Alpha Vantage (all commodities). The daily-cache check skips API calls for instruments whose latest stored close is already today's, so back-to-back refreshes within a trading day are free.
 - **Save** — Writes API keys back to your `.env` file and persists all other settings (thresholds, overlay choices, AI model preferences) to the local database. Settings survive app restarts.
 - **Report** — Opens the Summary Report window for generating retrospective analyses across time periods. See the **Summary Reports** section below.
 - **Help** — Opens this help window.

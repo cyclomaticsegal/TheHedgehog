@@ -4,6 +4,9 @@
 # Build artifacts
 /target/
 
+# Vendored JS dependencies
+vendor/dexter/node_modules/
+
 # Local data
 /data/
 
