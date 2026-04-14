@@ -383,6 +383,20 @@ impl Storage {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn load_inference_by_id(&self, id: i64) -> Result<Option<SavedInference>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, provider, model, response, vix_close, vix_level, \
+                    hypothesis_question, hypothesis_outcomes, hypothesis_context, overlay_instruments \
+             FROM ai_inferences WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], row_to_saved_inference)?;
+        match rows.next() {
+            Some(Ok(inf)) => Ok(Some(inf)),
+            Some(Err(e)) => Err(e.into()),
+            None => Ok(None),
+        }
+    }
+
     pub fn load_inferences_in_range(
         &self,
         from: NaiveDate,
@@ -451,6 +465,22 @@ impl Storage {
         if let Some(row) = rows.next()? {
             let json: String = row.get(0)?;
             Ok(Some(json))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load just the model_id linked to an inference, regardless of whether
+    /// a full response_json exists. Used to recover models that timed out
+    /// locally but may have completed on the server.
+    pub fn load_folds_model_id_for_inference(&self, inference_id: i64) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT model_id FROM folds_models WHERE inference_id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![inference_id])?;
+        if let Some(row) = rows.next()? {
+            let model_id: String = row.get(0)?;
+            Ok(Some(model_id))
         } else {
             Ok(None)
         }

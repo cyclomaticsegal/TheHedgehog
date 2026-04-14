@@ -52,6 +52,7 @@ enum CentralView {
     Charts,
     Model,
     ResearchAgent,
+    Report,
 }
 
 /// Navigation stack within the 51Folds model explorer. Each variant is
@@ -518,12 +519,16 @@ pub struct DashboardApp {
     // AI analysis state
     ai_task: LlmTask,
     ai_response: Option<String>,
+    /// Source of the current inference ("anthropic", "openai", "dexter:anthropic", etc.)
+    ai_response_provider: Option<String>,
     ai_panel_open: bool,
     ai_panel_content_height: f32,
     ai_markdown_cache: egui_commonmark::CommonMarkCache,
     inference_history: Vec<SavedInference>,
+    history_page: usize,
     // Report generation state (Phase 2)
-    show_report_window: bool,
+    #[allow(dead_code)]
+    show_report_window: bool, // retained for settings persistence compatibility
     report_from: String,
     report_to: String,
     report_inferences: Vec<SavedInference>,
@@ -998,10 +1003,12 @@ impl DashboardApp {
             show_activity_log: true,
             ai_task: LlmTask::new(),
             ai_response: None,
+            ai_response_provider: None,
             ai_panel_open: false,
             ai_panel_content_height: 200.0,
             ai_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             inference_history: Vec::new(),
+            history_page: 0,
             show_report_window: false,
             report_from: String::new(),
             report_to: String::new(),
@@ -1209,6 +1216,11 @@ impl DashboardApp {
             }
         }
 
+        // Pass the Hedgehog database path so /51folds can write hypotheses.
+        let db_path = database_path();
+        let db_path_str = db_path.display().to_string();
+        exports.push_str(&format!(" && export HEDGEHOG_DB_PATH='{db_path_str}'"));
+
         let settings = egui_term::BackendSettings {
             shell: "sh".to_string(),
             args: vec![
@@ -1236,6 +1248,8 @@ impl DashboardApp {
 
     /// Drain PTY events for the research terminal.
     fn poll_research_terminal(&mut self) {
+        let mut dexter_inference_id: Option<i64> = None;
+
         let Some(ref rx) = self.research_terminal.pty_rx else {
             return;
         };
@@ -1246,13 +1260,21 @@ impl DashboardApp {
                         self.research_terminal.child_exited = Some(code);
                         self.research_terminal.backend = None;
                         self.research_terminal.pty_rx = None;
-                        return;
+                        break;
                     }
                     egui_term::PtyEvent::Exit => {
                         self.research_terminal.child_exited = Some(0);
                         self.research_terminal.backend = None;
                         self.research_terminal.pty_rx = None;
-                        return;
+                        break;
+                    }
+                    egui_term::PtyEvent::Title(ref title) => {
+                        // /51folds signals hypothesis ready via OSC title.
+                        if let Some(id_str) = title.strip_prefix("51folds:ready:") {
+                            if let Ok(id) = id_str.parse::<i64>() {
+                                dexter_inference_id = Some(id);
+                            }
+                        }
                     }
                     _ => {}
                 },
@@ -1263,9 +1285,14 @@ impl DashboardApp {
                     }
                     self.research_terminal.backend = None;
                     self.research_terminal.pty_rx = None;
-                    return;
+                    break;
                 }
             }
+        }
+
+        // Handle dexter inference signal after the borrow is released.
+        if let Some(id) = dexter_inference_id {
+            self.load_dexter_inference(id);
         }
     }
 
@@ -1781,6 +1808,7 @@ impl DashboardApp {
                 self.draft_hypothesis = hypothesis;
                 self.folds_task.reset();
                 self.ai_response = Some(result.response);
+                self.ai_response_provider = Some(result.provider.clone());
                 self.reload_inference_history();
             }
             LlmPoll::Failed | LlmPoll::Pending | LlmPoll::Idle => {}
@@ -1824,6 +1852,27 @@ impl DashboardApp {
     /// Hypothesis fields come from the persisted columns when present
     /// (post-migration rows); falls back to re-parsing the raw response
     /// markdown for older rows that pre-date the migration.
+    /// Load a Dexter-generated hypothesis from the database (triggered
+    /// by the OSC title signal from `/51folds`).
+    fn load_dexter_inference(&mut self, id: i64) {
+        match self.storage.load_inference_by_id(id) {
+            Ok(Some(inf)) => {
+                self.load_historical_inference(inf);
+                self.reload_inference_history();
+                self.set_status(
+                    &format!("Research hypothesis loaded (inference #{id})"),
+                    StatusKind::Success,
+                );
+            }
+            Ok(None) => {
+                eprintln!("warn: dexter signalled inference #{id} but row not found");
+            }
+            Err(e) => {
+                eprintln!("warn: failed to load dexter inference #{id}: {e:#}");
+            }
+        }
+    }
+
     fn load_historical_inference(&mut self, inf: SavedInference) {
         let hypothesis = match (
             inf.hypothesis_question.clone(),
@@ -1857,25 +1906,28 @@ impl DashboardApp {
         self.folds_task.reset();
         if let Ok(Some(json)) = self.storage.load_folds_response_for_inference(inf.id) {
             self.folds_task.load_from_json(&json);
-            // Navigate to the 51Folds tab whenever the inference has a
-            // linked model, even if the stored JSON turned out to be a
-            // stub. The central panel will render either the Outcome
-            // view (complete model) or the "Model data is incomplete"
-            // recovery screen (stubbed model) — both are better than
-            // silently staying on the Charts view.
             if self.folds_task.model_id.is_some() {
                 self.central_view = CentralView::Model;
                 self.model_view = ModelView::Outcome;
             }
-            // Stubbed model + API key available → kick off an
-            // automatic refresh so the model self-heals from the
-            // server without the user having to click Refresh. The
-            // recovery screen will show the in-flight spinner and
-            // swap in the real data as soon as GET returns.
+            // Stubbed/incomplete model + API key → auto-refresh from server.
             if !self.folds_task.is_complete()
                 && self.folds_task.model_id.is_some()
                 && !self.api_keys.folds.trim().is_empty()
             {
+                self.start_folds_refresh();
+            }
+        } else if let Ok(Some(model_id)) =
+            self.storage.load_folds_model_id_for_inference(inf.id)
+        {
+            // Model exists but has no response_json (e.g. timed out
+            // locally). Set the model_id and auto-refresh from the
+            // server — the model may have completed after the app
+            // stopped polling.
+            self.folds_task.model_id = Some(model_id);
+            self.central_view = CentralView::Model;
+            self.model_view = ModelView::Outcome;
+            if !self.api_keys.folds.trim().is_empty() {
                 self.start_folds_refresh();
             }
         }
@@ -1889,6 +1941,7 @@ impl DashboardApp {
 
         self.outcomes_task = LlmTask::new();
         self.ai_response = Some(inf.response);
+        self.ai_response_provider = Some(inf.provider);
         self.ai_task.error = None;
         self.ai_panel_open = true;
     }
@@ -2273,8 +2326,9 @@ impl DashboardApp {
     fn reload_inference_history(&mut self) {
         self.inference_history = self
             .storage
-            .load_recent_inferences(20)
+            .load_recent_inferences(100)
             .unwrap_or_default();
+        self.history_page = 0;
         self.reload_folds_status_map();
     }
 
@@ -2402,8 +2456,17 @@ impl DashboardApp {
         reanalyze: &mut bool,
     ) {
         ui.horizontal(|ui| {
+            let panel_title = if self
+                .ai_response_provider
+                .as_deref()
+                .is_some_and(|p| p.starts_with("dexter"))
+            {
+                "Research Analysis"
+            } else {
+                "AI Analysis"
+            };
             ui.label(
-                RichText::new("AI Analysis")
+                RichText::new(panel_title)
                     .strong()
                     .size(11.0)
                     .color(TEXT_SECONDARY),
@@ -2660,6 +2723,32 @@ impl DashboardApp {
                     .color(TEXT_MUTED),
             );
             return;
+        }
+
+        // ── Background build indicator ────────────────────────────
+        // When a model is building in the background but the user is
+        // viewing a different (loaded) model, show a small bar to
+        // let them switch back to the in-progress view.
+        if self.folds_task.in_flight
+            && !self.folds_task.reevaluating
+            && self.folds_task.is_complete()
+        {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new("New model building...")
+                        .size(10.0)
+                        .color(ACCENT_BLUE),
+                );
+                if ui.small_button("Show").clicked() {
+                    // Clear the loaded model so the central view
+                    // reverts to the build-in-progress spinner.
+                    self.folds_task.model = None;
+                    self.central_view = CentralView::Model;
+                    self.model_view = ModelView::Outcome;
+                }
+            });
+            ui.add_space(4.0);
         }
 
         // ── Post-creation: completed model → compact summary ──────
@@ -3384,7 +3473,25 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             return;
         }
 
-        // Render terminal widget.
+        // Render terminal widget. Skip when the Report window is open
+        // because egui_term renders at a z-level that covers egui::Window.
+        if self.show_help {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("Terminal paused while dialog is open")
+                        .size(12.0)
+                        .color(TEXT_MUTED),
+                );
+            });
+            return;
+        }
+
+        // Render the terminal. The central panel already has 16px left
+        // inner_margin, but the first-column circle glyphs extend slightly
+        // left of their character cell. We can't add more padding without
+        // breaking the terminal's height allocation, so we accept the
+        // minor left-edge clip — it's a limitation of egui_term rendering
+        // character cells flush to the allocated rect boundary.
         if let Some(ref mut backend) = self.research_terminal.backend {
             let available = ui.available_size();
             let terminal_view = egui_term::TerminalView::new(ui, backend)
@@ -3392,6 +3499,253 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                 .set_size(available)
                 .set_theme(hedgehog_terminal_theme());
             ui.add(terminal_view);
+        }
+    }
+
+    /// Summary Report rendered inline in the central panel.
+    fn render_central_report_view(&mut self, ui: &mut egui::Ui) {
+        let max_width = 720.0_f32;
+        let available_w = ui.available_width();
+        let side_pad = ((available_w - max_width) / 2.0).max(0.0);
+
+        let mut start_report = false;
+        let mut load_inferences = false;
+        let mut load_history: Option<SavedInference> = None;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(20.0);
+
+                // Centered column
+                ui.horizontal(|ui| {
+                    ui.add_space(side_pad);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(max_width);
+
+                        ui.label(
+                            RichText::new("Summary Report")
+                                .size(22.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                        ui.add_space(14.0);
+
+                        // Date range controls
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("From:")
+                                    .size(13.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.report_from)
+                                    .desired_width(110.0)
+                                    .hint_text("YYYY-MM-DD"),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("To:")
+                                    .size(13.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.report_to)
+                                    .desired_width(110.0)
+                                    .hint_text("YYYY-MM-DD"),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let today = chrono::Utc::now().date_naive();
+                            if ui.small_button("Last 7 days").clicked() {
+                                self.report_from =
+                                    (today - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
+                                self.report_to = today.format("%Y-%m-%d").to_string();
+                            }
+                            if ui.small_button("Last 30 days").clicked() {
+                                self.report_from =
+                                    (today - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+                                self.report_to = today.format("%Y-%m-%d").to_string();
+                            }
+                            if ui.small_button("Last 90 days").clicked() {
+                                self.report_from =
+                                    (today - chrono::Duration::days(90)).format("%Y-%m-%d").to_string();
+                                self.report_to = today.format("%Y-%m-%d").to_string();
+                            }
+                            if ui.small_button("All").clicked() {
+                                self.report_from = "2020-01-01".to_owned();
+                                self.report_to = today.format("%Y-%m-%d").to_string();
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Load Inferences").clicked() {
+                                load_inferences = true;
+                            }
+                            if !self.report_inferences.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} inferences loaded",
+                                        self.report_inferences.len()
+                                    ))
+                                    .size(13.0)
+                                    .color(TEXT_SECONDARY),
+                                );
+                                if self.report_task.in_flight {
+                                    ui.spinner();
+                                } else {
+                                    ui.add_space(8.0);
+                                    if ui.button("Generate Report").clicked() {
+                                        start_report = true;
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        // Error
+                        if let Some(ref err) = self.report_task.error {
+                            ui.label(
+                                RichText::new(err)
+                                    .color(ALERT_EXTREME_FG)
+                                    .size(14.0),
+                            );
+                            ui.add_space(8.0);
+                        }
+
+                        // In-flight
+                        if self.report_task.in_flight {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    RichText::new("Generating report...")
+                                        .size(14.0)
+                                        .color(TEXT_SECONDARY),
+                                );
+                            });
+                        } else if let Some(ref report) = self.report_result {
+                            // Render the generated report as markdown
+                            let v = ui.visuals_mut();
+                            v.override_text_color = Some(TEXT_PRIMARY);
+                            v.widgets.noninteractive.fg_stroke =
+                                egui::Stroke::new(1.0, TEXT_PRIMARY);
+                            v.widgets.active.fg_stroke =
+                                egui::Stroke::new(1.0, Color32::WHITE);
+                            egui_commonmark::CommonMarkViewer::new()
+                                .show(ui, &mut self.report_markdown_cache, report);
+                        } else if !self.report_inferences.is_empty() {
+                            // Browsable inference list
+                            ui.label(
+                                RichText::new("Loaded Inferences")
+                                    .strong()
+                                    .size(14.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                            ui.add_space(6.0);
+                            // Truncation target: fit within the max column width
+                            // minus the dot + badge. Use word-boundary truncation.
+                            let label_max_chars = 90;
+
+                            for inf in &self.report_inferences {
+                                let level_color = match inf.vix_level.as_deref() {
+                                    Some("extreme") => ALERT_EXTREME_FG,
+                                    Some("approaching_extreme") => ALERT_APPROACHING_FG,
+                                    _ => ALERT_NORMAL_FG,
+                                };
+                                let full_label = inference_label(inf);
+                                let folds_badge = self.folds_status_by_inference.get(&inf.id);
+
+                                // Word-boundary truncation with ellipsis
+                                let display_label = if full_label.chars().count() > label_max_chars {
+                                    let truncated: String = full_label.chars().take(label_max_chars).collect();
+                                    // Find last space for word boundary
+                                    if let Some(last_space) = truncated.rfind(' ') {
+                                        format!("{}...", &truncated[..last_space])
+                                    } else {
+                                        format!("{truncated}...")
+                                    }
+                                } else {
+                                    full_label.clone()
+                                };
+
+                                // Full row as a clickable area with hover highlight
+                                let row_resp = ui.horizontal(|ui| {
+                                    let (dot_rect, _) = ui.allocate_exact_size(
+                                        Vec2::new(12.0, 12.0),
+                                        Sense::hover(),
+                                    );
+                                    ui.painter().circle_filled(
+                                        dot_rect.center(),
+                                        6.0,
+                                        level_color,
+                                    );
+                                    ui.add_space(6.0);
+                                    // Fixed-width 51Folds model column
+                                    let (badge_text, badge_color, badge_tip) = match folds_badge {
+                                        Some((mid, status)) => {
+                                            let tip = format!("51Folds model {mid} — {status}");
+                                            match status.as_str() {
+                                                "success" => (mid.clone(), ALERT_NORMAL_FG, tip),
+                                                "pending" => (format!("{mid}.."), ACCENT_BLUE, tip),
+                                                _ => (format!("{mid}!"), ALERT_EXTREME_FG, tip),
+                                            }
+                                        }
+                                        None => ("\u{2014}".to_owned(), TEXT_MUTED, "No 51Folds model".to_owned()),
+                                    };
+                                    let badge_resp = ui.allocate_ui_with_layout(
+                                        Vec2::new(40.0, 18.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(&badge_text)
+                                                    .size(13.0)
+                                                    .color(badge_color),
+                                            );
+                                        },
+                                    );
+                                    badge_resp.response.on_hover_text(&badge_tip);
+                                    ui.label(
+                                        RichText::new(&display_label)
+                                            .size(13.0)
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                });
+                                // Make the entire row clickable with hover feedback
+                                let row_rect = row_resp.response.rect;
+                                let row_sense = ui.allocate_rect(row_rect, Sense::click());
+                                if row_sense.hovered() {
+                                    ui.painter().rect_filled(
+                                        row_rect,
+                                        4.0,
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+                                    );
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                if row_sense.clicked() {
+                                    load_history = Some(inf.clone());
+                                }
+                                if display_label != full_label {
+                                    row_sense.on_hover_text(&full_label);
+                                }
+                            }
+                        }
+                    });
+                });
+            });
+
+        if load_inferences {
+            self.load_report_inferences();
+        }
+        if start_report {
+            self.start_report_generation();
+        }
+        if let Some(inf) = load_history {
+            self.load_historical_inference(inf);
         }
     }
 
@@ -3736,6 +4090,9 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                         self.model_view_back = ModelView::VisualMap;
                         self.model_view = ModelView::DriverDetail(idx);
                     }
+                }
+                crate::dag::DagIpcMessage::Ready => {
+                    self.dag_webview.mark_ready();
                 }
             }
         }
@@ -5013,7 +5370,6 @@ impl eframe::App for DashboardApp {
             && self.model_view == ModelView::VisualMap
             && self.folds_task.is_complete()
             && !self.show_help
-            && !self.show_report_window
             && !self.revert_to_original_confirm
             && !self.splash.is_active();
         if !dag_should_be_visible {
@@ -5232,10 +5588,6 @@ impl DashboardApp {
                             self.custom_zoom = None;
                         }
                     }
-                    ui.separator();
-                    if ui.button("Report").clicked() {
-                        self.show_report_window = !self.show_report_window;
-                    }
                 }
 
                 // Model navigation (only when 51Folds tab is active)
@@ -5243,6 +5595,16 @@ impl DashboardApp {
                     ui.selectable_value(&mut self.model_view, ModelView::Outcome, "Outcome");
                     ui.selectable_value(&mut self.model_view, ModelView::DriverList, "Drivers");
                     ui.selectable_value(&mut self.model_view, ModelView::VisualMap, "Visual Map");
+                }
+
+                // Report — always available (covers both AI and Research analyses)
+                ui.separator();
+                if ui.button("Report").clicked() {
+                    if self.central_view == CentralView::Report {
+                        self.central_view = CentralView::Charts;
+                    } else {
+                        self.central_view = CentralView::Report;
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -5506,7 +5868,14 @@ impl DashboardApp {
                                 // and that combined with our explicit
                                 // on_hover_text produced two tooltips.
                                 let mut load_inference: Option<SavedInference> = None;
-                                for inf in &self.inference_history {
+                                let page_size = 10;
+                                let total = self.inference_history.len();
+                                let total_pages = (total + page_size - 1) / page_size;
+                                let start = self.history_page * page_size;
+                                let end = (start + page_size).min(total);
+                                let page_items = &self.inference_history[start..end];
+
+                                for inf in page_items {
                                     let level_color = match inf.vix_level.as_deref() {
                                         Some("extreme") => ALERT_EXTREME_FG,
                                         Some("approaching_extreme") => ALERT_APPROACHING_FG,
@@ -5568,6 +5937,47 @@ impl DashboardApp {
                                 }
                                 if let Some(inf) = load_inference {
                                     self.load_historical_inference(inf);
+                                }
+                                // Paging controls
+                                if total_pages > 1 {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add_enabled(
+                                                self.history_page > 0,
+                                                egui::Button::new(
+                                                    RichText::new("\u{25C0}")
+                                                        .size(9.0)
+                                                        .color(TEXT_SECONDARY),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.history_page -= 1;
+                                        }
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{}/{}",
+                                                self.history_page + 1,
+                                                total_pages,
+                                            ))
+                                            .size(9.0)
+                                            .color(TEXT_MUTED),
+                                        );
+                                        if ui
+                                            .add_enabled(
+                                                self.history_page + 1 < total_pages,
+                                                egui::Button::new(
+                                                    RichText::new("\u{25B6}")
+                                                        .size(9.0)
+                                                        .color(TEXT_SECONDARY),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.history_page += 1;
+                                        }
+                                    });
                                 }
                                 ui.add_space(6.0);
                                 if ui.button("Clear History").clicked() {
@@ -5671,9 +6081,12 @@ impl DashboardApp {
         // fall back to a light system theme. This is especially important
         // for the 51Folds model tabs, which otherwise rendered white text
         // on a near-white background on macOS Light mode.
+        // Widen left margin when the Research Agent terminal is active so
+        // the first-column circle glyphs aren't clipped by the panel edge.
+        let central_left = if self.central_view == CentralView::ResearchAgent { 30 } else { 16 };
         let central_frame = egui::Frame::default()
             .fill(PANEL_BG)
-            .inner_margin(egui::Margin::symmetric(16, 12));
+            .inner_margin(egui::Margin { left: central_left, right: 16, top: 12, bottom: 12 });
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             match self.central_view {
                 CentralView::Charts => {
@@ -5756,6 +6169,9 @@ impl DashboardApp {
                 CentralView::ResearchAgent => {
                     self.render_research_agent_panel(ui);
                 }
+                CentralView::Report => {
+                    self.render_central_report_view(ui);
+                }
             }
         });
 
@@ -5777,199 +6193,6 @@ impl DashboardApp {
             }
         }
 
-        // -- Report window --
-        if self.show_report_window {
-            let screen = ctx.screen_rect();
-            let win_width = (screen.width() * 0.75).min(1000.0).max(600.0);
-            let win_height = (screen.height() * 0.85).min(900.0);
-            let mut start_report = false;
-            let mut load_inferences = false;
-            // Hoisted out of the show() closure so we can call
-            // self.load_historical_inference(...) AFTER the .open()
-            // borrow of self.show_report_window has been released.
-            let mut load_history: Option<SavedInference> = None;
-            egui::Window::new("Summary Report")
-                .open(&mut self.show_report_window)
-                .default_size([win_width, win_height])
-                .default_pos([
-                    (screen.width() - win_width) / 2.0,
-                    (screen.height() - win_height) / 2.0,
-                ])
-                .resizable(true)
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("From:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.report_from)
-                                .desired_width(100.0)
-                                .hint_text("YYYY-MM-DD"),
-                        );
-                        ui.label("To:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.report_to)
-                                .desired_width(100.0)
-                                .hint_text("YYYY-MM-DD"),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        let today = chrono::Utc::now().date_naive();
-                        if ui.small_button("Last 7 days").clicked() {
-                            self.report_from =
-                                (today - chrono::Duration::days(7)).format("%Y-%m-%d").to_string();
-                            self.report_to = today.format("%Y-%m-%d").to_string();
-                        }
-                        if ui.small_button("Last 30 days").clicked() {
-                            self.report_from =
-                                (today - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
-                            self.report_to = today.format("%Y-%m-%d").to_string();
-                        }
-                        if ui.small_button("Last 90 days").clicked() {
-                            self.report_from =
-                                (today - chrono::Duration::days(90)).format("%Y-%m-%d").to_string();
-                            self.report_to = today.format("%Y-%m-%d").to_string();
-                        }
-                        if ui.small_button("All").clicked() {
-                            self.report_from = "2020-01-01".to_owned();
-                            self.report_to = today.format("%Y-%m-%d").to_string();
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Load Inferences").clicked() {
-                            load_inferences = true;
-                        }
-                        if !self.report_inferences.is_empty() {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} inferences loaded",
-                                    self.report_inferences.len()
-                                ))
-                                .size(11.0)
-                                .color(TEXT_SECONDARY),
-                            );
-                            if self.report_task.in_flight {
-                                ui.spinner();
-                            } else if ui.button("Generate Report").clicked() {
-                                start_report = true;
-                            }
-                        }
-                    });
-                    ui.separator();
-
-                    if let Some(ref err) = self.report_task.error {
-                        ui.label(
-                            RichText::new(err)
-                                .color(ALERT_EXTREME_FG)
-                                .size(12.0),
-                        );
-                    }
-
-                    if self.report_task.in_flight {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(
-                                RichText::new("Generating report...")
-                                    .size(12.0)
-                                    .color(TEXT_SECONDARY),
-                            );
-                        });
-                    } else if let Some(ref report) = self.report_result {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            // Belt-and-suspenders: re-assert readable text
-                            // colors for the markdown viewer in case anything
-                            // upstream mutated visuals for this frame.
-                            let v = ui.visuals_mut();
-                            v.override_text_color = Some(TEXT_PRIMARY);
-                            v.widgets.noninteractive.fg_stroke =
-                                egui::Stroke::new(1.0, TEXT_PRIMARY);
-                            v.widgets.noninteractive.weak_bg_fill = TEXT_SECONDARY;
-                            v.widgets.active.fg_stroke =
-                                egui::Stroke::new(1.0, Color32::WHITE);
-                            egui_commonmark::CommonMarkViewer::new()
-                                .show(ui, &mut self.report_markdown_cache, report);
-                        });
-                    } else if !self.report_inferences.is_empty() {
-                        // Browsable inference list
-                        ui.label(
-                            RichText::new("Loaded Inferences")
-                                .strong()
-                                .size(12.0)
-                                .color(TEXT_SECONDARY),
-                        );
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical()
-                            .max_height(400.0)
-                            .show(ui, |ui| {
-                                for inf in &self.report_inferences {
-                                    let level_color = match inf.vix_level.as_deref() {
-                                        Some("extreme") => ALERT_EXTREME_FG,
-                                        Some("approaching_extreme") => ALERT_APPROACHING_FG,
-                                        _ => ALERT_NORMAL_FG,
-                                    };
-                                    let label = inference_label(inf);
-                                    let folds_badge = self.folds_status_by_inference.get(&inf.id);
-                                    let resp = ui.horizontal(|ui| {
-                                        let (dot_rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(10.0, 10.0),
-                                            Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(
-                                            dot_rect.center(),
-                                            5.0,
-                                            level_color,
-                                        );
-                                        ui.add_space(4.0);
-                                        // Fixed-width 51Folds model column
-                                        let (badge_text, badge_color, badge_tip) = match folds_badge {
-                                            Some((mid, status)) => {
-                                                let tip = format!("51Folds model {mid} — {status}");
-                                                match status.as_str() {
-                                                    "success" => (mid.clone(), ALERT_NORMAL_FG, tip),
-                                                    "pending" => (format!("{mid}.."), ACCENT_BLUE, tip),
-                                                    _ => (format!("{mid}!"), ALERT_EXTREME_FG, tip),
-                                                }
-                                            }
-                                            None => ("\u{2014}".to_owned(), TEXT_MUTED, "No 51Folds model for this inference".to_owned()),
-                                        };
-                                        let badge_resp = ui.allocate_ui_with_layout(
-                                            Vec2::new(36.0, 16.0),
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new(&badge_text)
-                                                        .size(11.0)
-                                                        .color(badge_color),
-                                                );
-                                            },
-                                        );
-                                        badge_resp.response.on_hover_text(&badge_tip);
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(label)
-                                                    .size(13.0)
-                                                    .color(TEXT_PRIMARY),
-                                            )
-                                            .sense(Sense::click()),
-                                        )
-                                    });
-                                    if resp.inner.clicked() {
-                                        load_history = Some(inf.clone());
-                                    }
-                                }
-                            });
-                    }
-                });
-            if load_inferences {
-                self.load_report_inferences();
-            }
-            if start_report {
-                self.start_report_generation();
-            }
-            if let Some(inf) = load_history {
-                self.load_historical_inference(inf);
-            }
-        }
     }
 
 }

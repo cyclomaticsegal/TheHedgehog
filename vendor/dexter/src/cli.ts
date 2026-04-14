@@ -310,9 +310,150 @@ export async function runCli() {
   /model       Switch LLM provider and model
   /rules       Show research rules
   /clear       Clear conversation
+  /51folds     Generate a 51Folds hypothesis
   ↑ / ↓        Navigate input history`;
 
+  // -----------------------------------------------------------------
+  // /51folds handler — synthesize conversation into a structured
+  // hypothesis and write it to the Hedgehog's database.
+  // -----------------------------------------------------------------
+  const handle51Folds = async (userDirection: string) => {
+    const dbPath = process.env.HEDGEHOG_DB_PATH;
+    if (!dbPath) {
+      chatLog.addChild(new Spacer(1));
+      chatLog.addChild(
+        new Text(theme.muted('HEDGEHOG_DB_PATH not set — /51folds is only available when running inside The Hedgehog.'), 0, 0),
+      );
+      tui.requestRender();
+      return;
+    }
+
+    // Gather conversation context
+    const messages = modelSelection.inMemoryChatHistory.getMessages();
+    if (messages.length === 0) {
+      chatLog.addChild(new Spacer(1));
+      chatLog.addChild(
+        new Text(theme.muted('No conversation history yet. Do some research first, then run /51folds.'), 0, 0),
+      );
+      tui.requestRender();
+      return;
+    }
+
+    const conversationContext = messages
+      .map(m => `User: ${m.query}\n\nAssistant: ${m.answer ?? '(no response)'}`)
+      .join('\n\n---\n\n');
+
+    const directionClause = userDirection
+      ? `\n\nUSER DIRECTION: The user has specifically asked you to focus on: "${userDirection}". Let this guide which angle, asset, or thesis becomes the hypothesis subject.`
+      : '';
+
+    const hypothesisPrompt = `You are generating a structured hypothesis for the 51Folds Bayesian forecasting platform based on the research conversation below.
+
+TASK: Synthesize the research into a single testable, time-bounded hypothesis suitable for Bayesian causal modelling. The hypothesis should be the strongest, most specific claim supported by the research.${directionClause}
+
+RESPOND USING EXACTLY THIS FORMAT (no other sections, no preamble):
+
+**Hypothesis**: [A substantive, time-bounded claim (7-90 days) explaining a specific price/behavior change and the mechanism driving it. Not a question. Shape: "[Subject] will [hold above / break above / fall below / spike to] [level] through [horizon] as [named mechanism] [holds / fails] despite [counter-pressure]."]
+**Hypothesis Outcomes**: [2-4 mutually exclusive outcomes, each ≤ 60 chars, representing distinct causal paths. Use pipe separator: "Outcome A — mechanism A | Outcome B — mechanism B | Outcome C — mechanism C"]
+**Hypothesis Context**: [MAX 300 words. The causal setup, transmission mechanism, confirming/contradicting signals, and why the chosen horizon is correct. Dense, no filler. This text is parsed by 51Folds to derive Bayesian driver nodes.]
+
+---
+RESEARCH CONVERSATION:
+
+${conversationContext}`;
+
+    chatLog.addChild(new Spacer(1));
+    chatLog.addChild(
+      new Text(theme.muted('Generating 51Folds hypothesis from conversation...'), 0, 0),
+    );
+    tui.requestRender();
+
+    const result = await agentRunner.runQuery(hypothesisPrompt);
+    if (!result?.answer) {
+      chatLog.addChild(
+        new Text(theme.muted('Could not generate hypothesis — no response from agent.'), 0, 0),
+      );
+      tui.requestRender();
+      return;
+    }
+
+    // Parse the structured fields from the response
+    const response = result.answer;
+    const hypothesisMatch = response.match(/\*\*Hypothesis\*\*:\s*([\s\S]*?)(?=\n\*\*Hypothesis Outcomes\*\*)/);
+    const outcomesMatch = response.match(/\*\*Hypothesis Outcomes\*\*:\s*([\s\S]*?)(?=\n\*\*Hypothesis Context\*\*)/);
+    const contextMatch = response.match(/\*\*Hypothesis Context\*\*:\s*([\s\S]*?)$/);
+
+    const hypothesisQuestion = hypothesisMatch?.[1]?.trim() ?? null;
+    const outcomesRaw = outcomesMatch?.[1]?.trim() ?? null;
+    const hypothesisContext = contextMatch?.[1]?.trim() ?? null;
+
+    const outcomesArray = outcomesRaw
+      ? outcomesRaw.split('|').map(o => o.trim()).filter(o => o.length > 0)
+      : null;
+
+    // Write to the Hedgehog's SQLite database
+    try {
+      const sqlite = await import('bun:sqlite');
+      const db = new sqlite.Database(dbPath);
+
+      const now = new Date().toISOString();
+      const provider = `dexter:${modelSelection.provider}`;
+      const model = modelSelection.model;
+      const userMsg = userDirection || '(conversation context)';
+
+      db.run(
+        `INSERT INTO ai_inferences
+         (created_at, provider, model, system_prompt, user_message, response,
+          hypothesis_question, hypothesis_outcomes, hypothesis_context)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          now,
+          provider,
+          model,
+          hypothesisPrompt,
+          userMsg,
+          response,
+          hypothesisQuestion,
+          outcomesArray ? JSON.stringify(outcomesArray) : null,
+          hypothesisContext,
+        ],
+      );
+
+      // Get the inserted row ID
+      const row = db.query<{ id: number }, []>(
+        'SELECT last_insert_rowid() as id',
+      ).get();
+      db.close();
+
+      const inferenceId = row?.id ?? 0;
+
+      // Signal the Hedgehog via OSC title sequence (invisible to user)
+      process.stdout.write(`\x1b]0;51folds:ready:${inferenceId}\x07`);
+
+      chatLog.addChild(new Spacer(1));
+      chatLog.addChild(
+        new Text(theme.muted(`Hypothesis saved to The Hedgehog (inference #${inferenceId}). Check the AI Analysis panel.`), 0, 0),
+      );
+      tui.requestRender();
+    } catch (err) {
+      chatLog.addChild(new Spacer(1));
+      chatLog.addChild(
+        new Text(theme.muted(`Failed to save hypothesis: ${err}`), 0, 0),
+      );
+      tui.requestRender();
+    }
+  };
+
   const handleSlashCommand = async (command: string) => {
+    // /51folds [optional directional prompt]
+    if (command === '51folds' || command.startsWith('51folds ')) {
+      const userDirection = command.startsWith('51folds ')
+        ? command.slice('51folds '.length).trim()
+        : '';
+      await handle51Folds(userDirection);
+      return;
+    }
+
     switch (command) {
       case 'model':
         modelSelection.startSelection();
@@ -637,6 +778,7 @@ export async function runCli() {
     slashSuggestions = matchCommands(text);
     slashSelectedIndex = 0;
     slashActive = slashSuggestions.length > 0;
+    editor.slashActive = slashActive;
     updateView();
     tui.requestRender();
   };
@@ -656,8 +798,14 @@ export async function runCli() {
     if (selected) {
       slashActive = false;
       slashSuggestions = [];
-      editor.setText('');
-      void handleSlashCommand(selected.name);
+      if (selected.name === '51folds') {
+        // Don't submit immediately — let the user append a directional
+        // prompt after the command. Enter will submit via handleSubmit.
+        editor.setText(`/${selected.name} `);
+      } else {
+        editor.setText('');
+        void handleSlashCommand(selected.name);
+      }
     }
     updateView();
     tui.requestRender();

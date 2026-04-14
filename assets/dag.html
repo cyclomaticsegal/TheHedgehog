@@ -392,6 +392,10 @@
   });
 
   init();
+
+  // Signal readiness to the Rust host — the webview stays hidden
+  // until this fires to avoid a white flash during initial load.
+  window.ipc.postMessage(JSON.stringify({ type: 'ready' }));
 })();
 </script>
 </body>

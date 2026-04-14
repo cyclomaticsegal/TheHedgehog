@@ -62,6 +62,7 @@ impl HasDisplayHandle for StoredWindowHandle {
 #[derive(Debug)]
 pub enum DagIpcMessage {
     NodeClicked { code: String },
+    Ready,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +96,8 @@ struct DagPayload {
 pub struct DagWebView {
     webview: Option<wry::WebView>,
     visible: bool,
+    /// Whether the JS side has signalled that the page is rendered.
+    ready: bool,
     ipc_rx: mpsc::Receiver<DagIpcMessage>,
     ipc_tx: mpsc::Sender<DagIpcMessage>,
     /// Generation of model data last sent to JS.
@@ -109,6 +112,7 @@ impl DagWebView {
         Self {
             webview: None,
             visible: false,
+            ready: false,
             ipc_rx: rx,
             ipc_tx: tx,
             data_generation: 0,
@@ -126,17 +130,23 @@ impl DagWebView {
         let result = wry::WebViewBuilder::new()
             .with_html(DAG_HTML)
             .with_bounds(bounds)
-            .with_visible(false)
-            .with_background_color((10, 14, 26, 255))
+            .with_transparent(true)
+            .with_background_color((10, 14, 26, 0))
             .with_ipc_handler(move |req| {
                 let body = req.body();
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
-                    if val["type"].as_str() == Some("click") {
-                        if let Some(code) = val["code"].as_str() {
-                            let _ = tx.send(DagIpcMessage::NodeClicked {
-                                code: code.to_owned(),
-                            });
+                    match val["type"].as_str() {
+                        Some("click") => {
+                            if let Some(code) = val["code"].as_str() {
+                                let _ = tx.send(DagIpcMessage::NodeClicked {
+                                    code: code.to_owned(),
+                                });
+                            }
                         }
+                        Some("ready") => {
+                            let _ = tx.send(DagIpcMessage::Ready);
+                        }
+                        _ => {}
                     }
                 }
             })
@@ -162,15 +172,22 @@ impl DagWebView {
         }
     }
 
-    /// Show or hide the native webview.
+    /// Show or hide the native webview. The webview stays hidden until
+    /// the JS side signals readiness to avoid a white flash on first load.
     pub fn set_visible(&mut self, visible: bool) {
-        if self.visible == visible {
+        let effective = visible && self.ready;
+        if self.visible == effective {
             return;
         }
-        self.visible = visible;
+        self.visible = effective;
         if let Some(ref wv) = self.webview {
-            let _ = wv.set_visible(visible);
+            let _ = wv.set_visible(effective);
         }
+    }
+
+    /// Mark the webview as ready (called when the JS "ready" IPC arrives).
+    pub fn mark_ready(&mut self) {
+        self.ready = true;
     }
 
     /// Send the full model data to the JS side for a complete re-render.

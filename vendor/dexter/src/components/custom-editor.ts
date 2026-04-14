@@ -78,10 +78,14 @@ export class CustomEditor extends Editor {
     // Default: pass to editor
     super.handleInput(data);
 
-    // Check if slash mode should activate or deactivate
+    // Check if slash mode should activate or deactivate.
+    // slashActive is only set here as a trigger for onSlashChange —
+    // the actual suggestion visibility is controlled by the callback
+    // (which sets slashActive based on whether matchCommands returns
+    // results). This ensures enter submits normally when no suggestions
+    // are showing.
     const newText = this.getText();
     if (newText.startsWith('/')) {
-      this.slashActive = true;
       this.onSlashChange?.(newText);
     } else if (this.slashActive) {
       this.slashActive = false;

@@ -4203,6 +4203,10 @@ function stubFalse(){return false}module.exports=stubFalse},{}],279:[function(re
   });
 
   init();
+
+  // Signal readiness to the Rust host — the webview stays hidden
+  // until this fires to avoid a white flash during initial load.
+  window.ipc.postMessage(JSON.stringify({ type: 'ready' }));
 })();
 </script>
 </body>
