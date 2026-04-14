@@ -21,6 +21,8 @@ uuid = { version = "1", features = ["v4"] }
 fiftyone-folds = { path = "vendor/fiftyone-folds" }
 tokio = { version = "1", features = ["rt", "time"] }
 egui_term = "0.1.0"
+wry = "0.55"
+raw-window-handle = "0.6"
 
 # The profile that 'dist' will build with
 [profile.dist]

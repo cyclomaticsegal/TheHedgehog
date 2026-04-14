@@ -63,6 +63,8 @@ enum ModelView {
     Outcome,
     /// Clean list of all drivers with pill selectors.
     DriverList,
+    /// Interactive DAG visualization of the causal network.
+    VisualMap,
     /// Full-page detail for one driver (by index in draft_drivers).
     DriverDetail(usize),
     /// Full-page content for one driver section.
@@ -531,6 +533,8 @@ pub struct DashboardApp {
     // Central panel view mode + navigation stack
     central_view: CentralView,
     model_view: ModelView,
+    /// Where to navigate back to from DriverDetail (DriverList or VisualMap).
+    model_view_back: ModelView,
     // 51Folds state (session-only, not persisted)
     parsed_hypothesis: Option<ParsedHypothesis>,
     draft_hypothesis: Option<ParsedHypothesis>,
@@ -559,6 +563,13 @@ pub struct DashboardApp {
     /// Maps inference_id → (model_id, status) for showing 51Folds badges
     /// in the history list and report window.
     folds_status_by_inference: std::collections::HashMap<i64, (String, String)>,
+    // -- DAG visualization --------------------------------------------------
+    /// Stored raw window handle from CreationContext for wry child webview.
+    stored_window_handle: Option<crate::dag::StoredWindowHandle>,
+    /// The embedded D3.js DAG webview (lazy-initialized on first Visual Map visit).
+    dag_webview: crate::dag::DagWebView,
+    /// Generation counter for detecting when model data needs re-sending to JS.
+    dag_model_generation: u64,
     /// Embedded Dexter terminal state (lazy-initialized on first tab switch).
     research_terminal: ResearchTerminal,
     /// Cached egui Context for TerminalBackend creation outside update().
@@ -830,6 +841,17 @@ fn is_checker_pixel(r: u8, g: u8, b: u8) -> bool {
 
 impl DashboardApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        // Capture the native window handle for the wry DAG webview.
+        use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+        let stored_wh = _cc
+            .window_handle()
+            .ok()
+            .and_then(|wh| {
+                _cc.display_handle().ok().map(|dh| {
+                    crate::dag::StoredWindowHandle::new(wh.as_raw(), dh.as_raw())
+                })
+            });
+
         // Apply global dark theme with design-system palette.
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = PANEL_BG;
@@ -989,6 +1011,7 @@ impl DashboardApp {
             report_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             central_view: CentralView::Charts,
             model_view: ModelView::Outcome,
+            model_view_back: ModelView::DriverList,
             parsed_hypothesis: None,
             draft_hypothesis: None,
             folds_task: FoldsTask::new(),
@@ -999,6 +1022,9 @@ impl DashboardApp {
             reeval_toast_until: None,
             revert_to_original_confirm: false,
             folds_status_by_inference: std::collections::HashMap::new(),
+            stored_window_handle: stored_wh,
+            dag_webview: crate::dag::DagWebView::new(),
+            dag_model_generation: 0,
             research_terminal: ResearchTerminal::new(),
             egui_ctx: _cc.egui_ctx.clone(),
             bias_deterministic: Vec::new(),
@@ -3596,28 +3622,125 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
 
         ui.add_space(18.0);
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                match self.model_view {
-                    ModelView::Outcome => {
-                        self.render_central_outcome_tab(ui);
+        // The Visual Map (DAG webview) fills the panel directly — it must
+        // NOT be inside a ScrollArea because the webview handles its own
+        // pan/zoom. All other views scroll normally.
+        if self.model_view == ModelView::VisualMap {
+            self.render_dag_view(ui);
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    match self.model_view {
+                        ModelView::Outcome => {
+                            self.render_central_outcome_tab(ui);
+                        }
+                        ModelView::DriverList => {
+                            self.render_central_drivers_tab(ui);
+                        }
+                        ModelView::DriverDetail(idx) => {
+                            self.render_driver_detail_page(ui, idx);
+                        }
+                        ModelView::DriverSection(idx, section) => {
+                            self.render_driver_section_page(ui, idx, section);
+                        }
+                        ModelView::VisualMap => {} // handled above
                     }
-                    ModelView::DriverList => {
-                        self.render_central_drivers_tab(ui);
-                    }
-                    ModelView::DriverDetail(idx) => {
-                        self.render_driver_detail_page(ui, idx);
-                    }
-                    ModelView::DriverSection(idx, section) => {
-                        self.render_driver_section_page(ui, idx, section);
-                    }
-                }
-            });
+                });
+        }
     }
 
     /// Outcome view: probability bars + take away, rendered as dark
     /// cards with high-contrast typography.
+    /// Render the DAG visualization via the embedded wry WebView.
+    fn render_dag_view(&mut self, ui: &mut egui::Ui) {
+        let available = ui.available_rect_before_wrap();
+        // Allocate the space in egui so it knows the area is used.
+        ui.allocate_rect(available, egui::Sense::hover());
+
+        // Convert egui logical rect to wry bounds (logical coordinates).
+        let bounds = wry::Rect {
+            position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(
+                available.left() as f64,
+                available.top() as f64,
+            )),
+            size: wry::dpi::Size::Logical(wry::dpi::LogicalSize::new(
+                available.width() as f64,
+                available.height() as f64,
+            )),
+        };
+
+        // Lazy-create the webview on first visit.
+        if !self.dag_webview.is_created() {
+            if let Some(ref handle) = self.stored_window_handle {
+                self.dag_webview.create(handle, bounds);
+            } else {
+                ui.label(
+                    RichText::new("Cannot create Visual Map: no window handle available.")
+                        .color(ALERT_EXTREME_FG)
+                        .size(12.0),
+                );
+                return;
+            }
+        }
+
+        if let Some(ref err) = self.dag_webview.error {
+            ui.label(
+                RichText::new(format!("Visual Map error: {err}"))
+                    .color(ALERT_EXTREME_FG)
+                    .size(12.0),
+            );
+            return;
+        }
+
+        // Reposition every frame.
+        self.dag_webview.set_bounds(bounds);
+        self.dag_webview.set_visible(true);
+
+        // Send model data if we have a model and the data hasn't been sent yet
+        // (or has changed due to re-evaluation).
+        if let Some(ref model) = self.folds_task.model {
+            // Build a generation from the draft driver states so we detect
+            // changes (pill edits, re-eval completion).
+            let mut hasher = 0u64;
+            for d in &self.folds_task.draft_drivers {
+                for b in d.selected_state.bytes() {
+                    hasher = hasher.wrapping_mul(31).wrapping_add(b as u64);
+                }
+            }
+            let generation = hasher;
+
+            if generation != self.dag_model_generation {
+                let driver_data: Vec<(String, String, String)> = self
+                    .folds_task
+                    .draft_drivers
+                    .iter()
+                    .map(|d| (d.code.clone(), d.name.clone(), d.selected_state.clone()))
+                    .collect();
+                self.dag_webview
+                    .send_model_data(model, &driver_data, generation);
+                self.dag_model_generation = generation;
+            }
+        }
+
+        // Poll IPC — handle node clicks.
+        while let Some(msg) = self.dag_webview.poll_ipc() {
+            match msg {
+                crate::dag::DagIpcMessage::NodeClicked { code } => {
+                    if let Some(idx) = self
+                        .folds_task
+                        .draft_drivers
+                        .iter()
+                        .position(|d| d.code == code)
+                    {
+                        self.model_view_back = ModelView::VisualMap;
+                        self.model_view = ModelView::DriverDetail(idx);
+                    }
+                }
+            }
+        }
+    }
+
     fn render_central_outcome_tab(&mut self, ui: &mut egui::Ui) {
         // ── Success toast (if a re-eval just completed) ────────────
         // Fades over the last 800 ms of its display window. Clickable
@@ -4080,14 +4203,20 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
     /// Full-page driver detail — state descriptions and navigable
     /// "Related" section, all rendered as dark cards.
     fn render_driver_detail_page(&mut self, ui: &mut egui::Ui, idx: usize) {
-        if back_button(ui, "Drivers").clicked() {
-            self.model_view = ModelView::DriverList;
+        let back_label = match self.model_view_back {
+            ModelView::VisualMap => "Visual Map",
+            _ => "Drivers",
+        };
+        if back_button(ui, back_label).clicked() {
+            self.model_view = self.model_view_back;
+            self.model_view_back = ModelView::DriverList;
             return;
         }
         ui.add_space(12.0);
 
         let Some(draft) = self.folds_task.draft_drivers.get(idx) else {
-            self.model_view = ModelView::DriverList;
+            self.model_view = self.model_view_back;
+            self.model_view_back = ModelView::DriverList;
             return;
         };
 
@@ -4877,6 +5006,20 @@ impl eframe::App for DashboardApp {
             return;
         }
 
+        // Hide the DAG webview when not on the Visual Map tab (it's a
+        // native view on top of the GPU surface and would float over
+        // other egui content).
+        let dag_should_be_visible = self.central_view == CentralView::Model
+            && self.model_view == ModelView::VisualMap
+            && self.folds_task.is_complete()
+            && !self.show_help
+            && !self.show_report_window
+            && !self.revert_to_original_confirm
+            && !self.splash.is_active();
+        if !dag_should_be_visible {
+            self.dag_webview.set_visible(false);
+        }
+
         self.poll_refresh();
         self.poll_ai();
         self.poll_bias_judge();
@@ -5099,6 +5242,7 @@ impl DashboardApp {
                 if self.central_view == CentralView::Model {
                     ui.selectable_value(&mut self.model_view, ModelView::Outcome, "Outcome");
                     ui.selectable_value(&mut self.model_view, ModelView::DriverList, "Drivers");
+                    ui.selectable_value(&mut self.model_view, ModelView::VisualMap, "Visual Map");
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

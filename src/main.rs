@@ -6,6 +6,7 @@ mod help;
 mod knowledge;
 mod models;
 mod providers;
+mod dag;
 mod eval;
 mod storage;
 
