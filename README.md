@@ -323,6 +323,9 @@ The project maintains Architecture Decision Records in `docs/adr/`:
 | 0014 | Model explorer navigation stack UI redesign |
 | 0015 | Dark theme hardening and 51Folds model explorer UI polish |
 | 0016 | Splash screen, revert architecture, and 51Folds PATCH/PUT drift (in limbo) |
+| 0017 | Commodity-bias evaluation and cross-model LLM judge |
+| 0018 | DAG visualization via D3.js in an embedded wry WebView |
+| 0019 | Dexter /51folds integration, research-to-model pipeline, and inline report view |
 
 ## License
 
