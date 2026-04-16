@@ -91,6 +91,10 @@ pub fn create_and_poll(
         };
 
         // POST /api/v1/models
+        tracing::info!(
+            inference_id = ?inference_id,
+            "folds: POST create"
+        );
         let create_resp = match client
             .models()
             .create(
@@ -106,12 +110,22 @@ pub fn create_and_poll(
         {
             Ok(r) => r,
             Err(e) => {
+                tracing::warn!(
+                    inference_id = ?inference_id,
+                    error = %e,
+                    "folds: POST create failed"
+                );
                 let _ = tx.send(FoldsResult::Failed(format!("{e}")));
                 return;
             }
         };
 
         let model_id = create_resp.first_model_id().to_owned();
+        tracing::info!(
+            model_id = %model_id,
+            inference_id = ?inference_id,
+            "folds: create accepted"
+        );
 
         // Persist pending row BEFORE polling so resume sweep can pick up
         // if the app closes mid-build.
@@ -131,10 +145,12 @@ pub fn create_and_poll(
             .await
         {
             Ok(model) => {
+                tracing::info!(model_id = %model_id, "folds: build complete");
                 persist_completed(&db_path, &model_id, &model);
                 let _ = tx.send(FoldsResult::Completed(Box::new(model)));
             }
             Err(FoldsError::ModelBuildFailed { model_id: mid, .. }) => {
+                tracing::warn!(model_id = %mid, "folds: build failed server-side");
                 storage::update_folds_model_status_standalone(
                     &db_path,
                     &mid,
@@ -144,6 +160,11 @@ pub fn create_and_poll(
                 let _ = tx.send(FoldsResult::Failed(format!("Model {mid} build failed")));
             }
             Err(FoldsError::PollTimeout { message }) => {
+                tracing::warn!(
+                    model_id = %model_id,
+                    message = %message,
+                    "folds: poll timeout"
+                );
                 storage::update_folds_model_status_standalone(
                     &db_path,
                     &model_id,
@@ -153,6 +174,11 @@ pub fn create_and_poll(
                 let _ = tx.send(FoldsResult::Failed(message));
             }
             Err(e) => {
+                tracing::warn!(
+                    model_id = %model_id,
+                    error = %e,
+                    "folds: unexpected poll error"
+                );
                 let _ = tx.send(FoldsResult::Failed(format!("{e}")));
             }
         }
@@ -384,21 +410,11 @@ pub fn refresh_model(
 // Resume polling for models left pending across app restarts
 // ---------------------------------------------------------------------------
 
-/// Called from the resume sweep on startup. No UI channel — only updates
-/// the database. Uses the remaining time from the 35-minute ceiling.
-pub fn resume_poll(
-    api_key: String,
-    model_id: String,
-    db_path: PathBuf,
-    created_at: DateTime<Utc>,
-) {
-    resume_poll_inner(api_key, model_id, db_path, created_at, None);
-}
-
-/// Like `resume_poll`, but sends progress through a channel so the UI can
-/// show a spinner and model ID while the build completes. Used for the most
-/// recent pending model on startup; the others use the fire-and-forget
-/// `resume_poll` which writes directly to the DB.
+/// Resume polling for an in-flight 51Folds build, sending progress
+/// through a channel so the UI can show a spinner and receive the
+/// completed model. ADR 0020 removed the previous fire-and-forget path
+/// — every pending build gets a real channel now, either to the
+/// foreground `FoldsTask` or to a backlog entry.
 pub fn resume_poll_ui(
     api_key: String,
     model_id: String,

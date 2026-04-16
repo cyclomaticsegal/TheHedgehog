@@ -373,16 +373,6 @@ impl Storage {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn load_recent_inferences(&self, limit: usize) -> Result<Vec<SavedInference>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, provider, model, response, vix_close, vix_level, \
-                    hypothesis_question, hypothesis_outcomes, hypothesis_context, overlay_instruments \
-             FROM ai_inferences ORDER BY created_at DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], row_to_saved_inference)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
     pub fn load_inference_by_id(&self, id: i64) -> Result<Option<SavedInference>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, provider, model, response, vix_close, vix_level, \
@@ -431,11 +421,6 @@ impl Storage {
         Ok(())
     }
 
-    pub fn clear_inferences(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM ai_inferences", [])?;
-        Ok(())
-    }
-
     // -----------------------------------------------------------------
     // 51Folds model tracking — used by start_folds_create + the resume
     // sweep on App::new. The polling threads themselves do not go
@@ -447,7 +432,7 @@ impl Storage {
     /// sweep on App::new.
     pub fn load_pending_folds_models(&self) -> Result<Vec<FoldsModelRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, model_id, status, created_at, completed_at, last_polled_at, question \
+            "SELECT id, model_id, status, created_at, completed_at, last_polled_at, question, inference_id \
              FROM folds_models WHERE status = ?1 ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![FOLDS_STATUS_PENDING], row_to_folds_record)?;
@@ -567,6 +552,7 @@ fn row_to_folds_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<FoldsModelRe
         completed_at: completed_str.as_deref().map(parse_rfc3339),
         last_polled_at: polled_str.as_deref().map(parse_rfc3339),
         question: row.get(6)?,
+        inference_id: row.get(7)?,
     })
 }
 

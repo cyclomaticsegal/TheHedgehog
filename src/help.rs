@@ -31,17 +31,15 @@ When the VIX spikes, it signals that institutional investors are rapidly reprici
 
 - **Crude Oil** reacts depending on the *type* of shock. Demand-driven crises (recessions, pandemics) push oil down sharply as growth expectations collapse. Supply-driven crises (geopolitical conflict) can push both VIX and oil higher simultaneously.
 
-- **Industrial Metals** (copper, aluminum) are pro-cyclical and tend to fall during VIX spikes, as they are proxies for global manufacturing and construction activity.
-
-- **Agricultural Commodities** (wheat, corn, soybeans) have weaker direct correlation with the VIX. They are driven more by weather, planting cycles, and trade policy. However, dollar strength during VIX spikes (flight-to-safety into USD) can pressure dollar-denominated commodity prices.
+- **Natural Gas** is heavily seasonal and regionally fragmented, but geopolitical disruption (e.g. Russia/Europe 2022) can produce extreme moves independent of VIX dynamics.
 
 - **Bitcoin** was initially positioned as an uncorrelated safe-haven asset, but empirical evidence shows it behaves primarily as a risk asset during VIX spikes — selling off alongside equities in March 2020 and throughout 2022.
 
 ### Key Historical Episodes
 
-- **2008 Global Financial Crisis**: VIX reached ~80. Gold initially dipped (margin calls forced liquidation) then rallied strongly. Crude oil collapsed from $147 to $32. Copper fell ~65%.
+- **2008 Global Financial Crisis**: VIX reached ~80. Gold initially dipped (margin calls forced liquidation) then rallied strongly. Crude oil collapsed from $147 to $32.
 - **2020 COVID Crash**: VIX hit ~82. Gold dipped briefly then reached all-time highs. WTI crude oil futures briefly went negative. Bitcoin crashed 50%+ in March before recovering.
-- **2022 Ukraine / Inflation**: VIX spiked to ~36. Energy, wheat, and nickel surged on supply disruption fears. Crypto sold off substantially.
+- **2022 Ukraine / Inflation**: VIX spiked to ~36. Energy surged on supply disruption fears. Crypto sold off substantially.
 
 ### Further Reading
 
@@ -443,7 +441,7 @@ Generated reports are themselves saved to the database, so they appear in future
 Provides the VIX daily close series (VIXCLS). Free API with generous rate limits.
 
 ### Alpha Vantage
-Provides daily spot prices for all commodities — Gold, Silver, Crude Oil (WTI), Natural Gas, Copper, Aluminum, Wheat, Corn, Soybeans — and Bitcoin via the digital-currency endpoint. Free tier: 25 requests/day, 1 request/second.
+Provides daily spot prices for Gold, Silver, Crude Oil (WTI), Natural Gas, and Bitcoin (via the digital-currency endpoint). Free tier: 25 requests/day, 1 request/second.
 
 The Hedgehog uses spot prices rather than ETF proxies because regime-shift analysis is sensitive to absolute price levels and percentile thresholds, and ETF tracking error / contango drift would muddy the signal.
 
@@ -463,6 +461,8 @@ API keys are **not** stored in the database. They live only in your `.env` file.
 No data is sent to external services other than:
 - API requests to FRED and Alpha Vantage for fetching market data
 - API requests to Anthropic or OpenAI when you use the AI Analysis or Report features
+
+Runtime logs are written to `data/logs/hedgehog.log.YYYY-MM-DD` (daily rotation). Useful for support triage — share the latest file if something went sideways.
 
 ---
 

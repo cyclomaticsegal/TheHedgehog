@@ -41,23 +41,22 @@ VIX levels are used (e.g. 25/35).",
         title: "Regime Taxonomy: Demand Shock",
         tags: "all",
         body: "A demand shock regime occurs when economic activity contracts sharply, pulling \
-down both equities and commodities tied to growth. Signature: VIX spikes, crude oil falls \
-(demand destruction), copper falls (manufacturing slowdown), agricultural commodities decline \
-(weaker consumption). Gold may initially sell off due to margin calls and liquidity crunch \
-before recovering as a safe haven. The dollar typically strengthens as capital flows to safety. \
-Historical examples: 2008 GFC (VIX ~89, oil from $147 to $35), 2020 COVID crash (VIX ~85, \
-WTI briefly negative). Duration: weeks to months.",
+down both equities and commodities tied to growth. Signature: VIX spikes, crude oil and \
+natural gas fall (demand destruction), Bitcoin sells off sharply as a risk asset. Gold may \
+initially sell off due to margin calls and liquidity crunch before recovering as a safe haven. \
+The dollar typically strengthens as capital flows to safety. Historical examples: 2008 GFC \
+(VIX ~89, oil from $147 to $35), 2020 COVID crash (VIX ~85, WTI briefly negative). Duration: \
+weeks to months.",
     },
     KnowledgeChunk {
         title: "Regime Taxonomy: Supply Shock",
         tags: "all",
         body: "A supply shock regime occurs when production or distribution of key commodities \
 is disrupted, typically by geopolitical conflict or policy. Signature: VIX rises moderately \
-(25-40 range, not extreme), energy prices spike (supply constrained), agricultural prices may \
-spike if conflict affects breadbasket regions, industrial metals may rise if sanctions restrict \
-supply. Gold rises on uncertainty premium. The key differentiator from demand shocks: \
-commodities and VIX move UP together rather than commodities falling. Historical examples: \
-2022 Ukraine invasion (energy +80%, wheat +50%, VIX ~36), 1973 oil embargo.",
+(25-40 range, not extreme), energy prices spike (supply constrained). Gold rises on \
+uncertainty premium. The key differentiator from demand shocks: commodities and VIX move UP \
+together rather than commodities falling. Historical examples: 2022 Ukraine invasion (energy \
++80%, VIX ~36), 1973 oil embargo.",
     },
     KnowledgeChunk {
         title: "Regime Taxonomy: Financial Contagion",
@@ -100,10 +99,9 @@ increase, which is typical in acute crisis phases.",
         body: "The US dollar typically strengthens during VIX spikes as global capital seeks \
 safety in US Treasuries and dollar-denominated assets. This dollar strength creates a headwind \
 for all dollar-denominated commodities — even those not directly affected by the underlying \
-shock. Agricultural commodities are particularly sensitive because they are priced in dollars \
-but produced globally; a stronger dollar makes them cheaper for US buyers but more expensive \
-for foreign buyers, suppressing demand. Gold is partially insulated because its safe-haven \
-demand can offset dollar headwinds, but silver and industrial metals feel the full effect.",
+shock. Gold is partially insulated because its safe-haven demand can offset dollar headwinds, \
+but silver feels the full effect. Crude oil and natural gas trade in dollars too, so a strong \
+dollar compounds any demand-driven weakness in energy.",
     },
     KnowledgeChunk {
         title: "2008 Global Financial Crisis",
@@ -112,10 +110,9 @@ demand can offset dollar headwinds, but silver and industrial metals feel the fu
 collapse. VIX peaked at 89.5 in October 2008. Key commodity responses: Gold initially dropped \
 ~25% from March-October 2008 as margin calls forced liquidation, then rallied to all-time \
 highs by 2011. Crude oil collapsed from $147 (July 2008) to $32 (December 2008) — a 78% \
-decline driven by demand destruction. Copper fell ~65%. Silver fell ~50% (industrial demand \
-collapse). Agricultural commodities fell 30-50%. The key lesson: in the acute phase of \
-financial contagion, ALL assets sell off as correlations spike to 1. Safe-haven behavior only \
-emerges after the liquidity crunch passes (typically 2-4 weeks).",
+decline driven by demand destruction. Silver fell ~50% (industrial demand collapse). The key \
+lesson: in the acute phase of financial contagion, ALL assets sell off as correlations spike \
+to 1. Safe-haven behavior only emerges after the liquidity crunch passes (typically 2-4 weeks).",
     },
     KnowledgeChunk {
         title: "2020 COVID Crash",
@@ -125,21 +122,18 @@ peaked at 82.7 in March 2020. Key commodity responses: Gold dipped briefly (-12%
 during the March liquidity crunch then rallied to all-time highs above $2,000 by August 2020. \
 WTI crude oil futures went negative on April 20, 2020 (storage crisis). Bitcoin crashed ~50% \
 in March 2020, disproving the digital gold narrative, but recovered to new highs by December. \
-Copper fell ~25% then recovered within 6 months on China stimulus. The key lesson: the \
-recovery was unusually fast due to unprecedented monetary and fiscal stimulus — the VIX \
-normalized within 3 months, much faster than 2008.",
+The key lesson: the recovery was unusually fast due to unprecedented monetary and fiscal \
+stimulus — the VIX normalized within 3 months, much faster than 2008.",
     },
     KnowledgeChunk {
         title: "2022 Ukraine / Inflation Shock",
         tags: "all",
         body: "The 2022 episode was a supply shock layered on existing inflation. VIX was \
 sustained in the 25-35 range (not extreme by crisis standards). Key commodity responses: \
-Natural gas spiked ~300% (European dependency on Russian gas). Wheat surged ~60% (Ukraine/Russia \
-are ~30% of global exports). Crude oil rose ~65%. Nickel briefly spiked 250% on a short \
-squeeze. Gold was range-bound despite high VIX because rising real interest rates offset safe \
-haven demand. Bitcoin fell ~65% (crypto winter, compounded by LUNA/FTX collapses). The key \
-lesson: supply shocks produce very different commodity winners vs demand shocks — energy and \
-agriculture UP rather than down.",
+Natural gas spiked ~300% (European dependency on Russian gas). Crude oil rose ~65%. Gold was \
+range-bound despite high VIX because rising real interest rates offset safe haven demand. \
+Bitcoin fell ~65% (crypto winter, compounded by LUNA/FTX collapses). The key lesson: supply \
+shocks produce very different commodity winners vs demand shocks — energy UP rather than down.",
     },
 
     // -----------------------------------------------------------------------
@@ -252,126 +246,6 @@ supply issue).",
     },
 
     // -----------------------------------------------------------------------
-    // Copper
-    // -----------------------------------------------------------------------
-    KnowledgeChunk {
-        title: "Copper: Global Growth Barometer",
-        tags: "copper",
-        body: "Copper is nicknamed 'Dr. Copper' for its reputation as a leading economic \
-indicator. It is used in construction, electronics, and manufacturing — all sectors that \
-contract during recessions. Copper falling alongside a rising VIX is one of the strongest \
-signals of a demand shock regime. The correlation between copper prices and global PMI \
-(Purchasing Managers Index) is historically above 0.7. China consumes approximately 50% of \
-global copper, so Chinese economic data and stimulus announcements are major price drivers. \
-Note that copper data in this dashboard is monthly, so short-lived VIX spikes may not be \
-visible in copper movements.",
-    },
-    KnowledgeChunk {
-        title: "Copper: PMI and China Demand",
-        tags: "copper",
-        body: "When VIX spikes and copper falls simultaneously, it strongly suggests a \
-demand-driven crisis rather than a supply or geopolitical event. The magnitude of copper's \
-decline during VIX spikes often indicates how much real economic damage the market expects. \
-In 2008, copper fell 65% — reflecting expectations of deep global recession. In 2020, copper \
-fell only 25% and recovered within 6 months, reflecting the market's assessment that the \
-demand shock was temporary and that Chinese stimulus would drive recovery. Copper NOT falling \
-during a VIX spike is a signal that the shock is not expected to affect real economic activity \
-(e.g. a contained financial event or brief geopolitical scare).",
-    },
-
-    // -----------------------------------------------------------------------
-    // Aluminum
-    // -----------------------------------------------------------------------
-    KnowledgeChunk {
-        title: "Aluminum: Energy-Cost Pass-Through",
-        tags: "aluminum",
-        body: "Aluminum smelting is extremely energy-intensive, making aluminum prices partially \
-a proxy for energy costs. During supply shocks where energy prices spike (e.g. 2022), aluminum \
-can rise even as demand weakens because production costs increase. This makes aluminum a hybrid \
-indicator: it falls during demand shocks (less construction/manufacturing) but may rise during \
-supply shocks (higher energy input costs). Chinese aluminum production accounts for ~60% of \
-global output, making Chinese energy policy and curtailment orders significant price drivers.",
-    },
-    KnowledgeChunk {
-        title: "Aluminum: China Supply Dominance",
-        tags: "aluminum",
-        body: "China produces approximately 60% of global primary aluminum. Chinese government \
-policies — environmental curtailments, power rationing, export restrictions — can cause \
-supply-side price spikes that are completely independent of VIX-driven market dynamics. When \
-analyzing aluminum behavior during VIX events, first check whether any China-specific supply \
-factors are in play. If aluminum moves sharply while other industrial metals are stable, the \
-driver is likely China supply policy rather than the VIX event. Data is monthly, limiting \
-visibility into short-term dynamics.",
-    },
-
-    // -----------------------------------------------------------------------
-    // Wheat
-    // -----------------------------------------------------------------------
-    KnowledgeChunk {
-        title: "Wheat: Black Sea Geopolitical Premium",
-        tags: "wheat",
-        body: "Ukraine and Russia together account for approximately 30% of global wheat \
-exports. Any conflict or trade disruption in the Black Sea region directly impacts global \
-wheat supply. The 2022 Ukraine invasion caused wheat prices to spike ~60% in weeks. This \
-geopolitical premium is independent of broader market dynamics — wheat can surge during a VIX \
-spike driven by geopolitical events even if other commodities are falling. When analyzing \
-wheat alongside VIX, check whether the VIX event has a Black Sea/Eastern European component. \
-If wheat is spiking but corn and soybeans are not, the driver is likely geopolitical supply \
-disruption rather than broad commodity demand.",
-    },
-    KnowledgeChunk {
-        title: "Wheat: Weather Risk and VIX Independence",
-        tags: "wheat",
-        body: "Wheat prices are primarily driven by weather events (drought, frost, excessive \
-rain during planting/harvest), global planting intentions, and trade policy. These factors are \
-largely independent of financial market volatility. A wheat price move during a VIX spike may \
-be coincidental rather than causal. To distinguish: if wheat moves in the same direction as \
-other commodities during a VIX spike, the VIX event is likely the driver (demand shock or \
-dollar strength). If wheat moves independently of other commodities, check for weather or \
-trade policy news.",
-    },
-
-    // -----------------------------------------------------------------------
-    // Corn
-    // -----------------------------------------------------------------------
-    KnowledgeChunk {
-        title: "Corn: Ethanol / Energy Linkage",
-        tags: "corn",
-        body: "Approximately 40% of US corn production goes to ethanol, creating a structural \
-price linkage between corn and energy markets. When gasoline prices rise (energy supply shock), \
-ethanol demand and corn prices tend to follow. This means corn can rise during supply shock \
-regimes that also lift energy prices, distinguishing it from other agricultural commodities. \
-During demand shocks, however, falling energy prices reduce ethanol demand and drag corn down. \
-This energy linkage makes corn a more VIX-correlated commodity than wheat or soybeans.",
-    },
-    KnowledgeChunk {
-        title: "Corn: Demand vs Supply Shock Differentiation",
-        tags: "corn",
-        body: "In demand shocks (2008, 2020), corn falls as both food and ethanol demand \
-contract. In supply shocks, corn may rise if energy prices are elevated (ethanol linkage) or \
-if the supply disruption affects corn-producing regions. The 2012 US drought caused corn to \
-spike 50% independently of VIX — a pure agricultural supply event. When corn moves during a \
-VIX spike, check: (1) is oil also moving the same direction (energy linkage), (2) are other \
-grains moving similarly (broad agricultural event), or (3) is corn moving alone (idiosyncratic \
-supply factor).",
-    },
-
-    // -----------------------------------------------------------------------
-    // Soybeans
-    // -----------------------------------------------------------------------
-    KnowledgeChunk {
-        title: "Soybeans: China Demand Concentration",
-        tags: "soybeans",
-        body: "China purchases approximately 60% of globally traded soybeans for animal feed \
-and cooking oil. This concentration makes soybean prices highly sensitive to US-China trade \
-relations. The 2018-2019 US-China trade war caused soybean prices to drop ~20% as China \
-shifted purchases to Brazil. During VIX spikes, if the underlying trigger involves US-China \
-tensions, soybeans may react disproportionately to other agricultural commodities. Soybeans \
-also have a structural growth story — rising global protein demand drives long-term price \
-support, so crisis-driven dips tend to recover faster than other agriculture.",
-    },
-
-    // -----------------------------------------------------------------------
     // Bitcoin
     // -----------------------------------------------------------------------
     KnowledgeChunk {
@@ -410,28 +284,4 @@ regulatory actions) can cause Bitcoin-specific VIX-independent drawdowns, as see
 (May 2022) and FTX (November 2022).",
     },
 
-    // -----------------------------------------------------------------------
-    // Cross-asset
-    // -----------------------------------------------------------------------
-    KnowledgeChunk {
-        title: "Industrial Metals: Pro-Cyclical VIX Relationship",
-        tags: "copper,aluminum",
-        body: "Copper and aluminum are both pro-cyclical industrial metals that tend to fall \
-during VIX spikes driven by demand shocks. Their prices reflect expectations for global \
-manufacturing and construction activity. When both industrial metals fall sharply alongside a \
-rising VIX, it confirms the market expects real economic contraction — not just financial \
-market stress. If industrial metals hold steady during a VIX spike, the shock is likely \
-confined to financial markets and not expected to spill into the real economy.",
-    },
-    KnowledgeChunk {
-        title: "Agriculture: Dollar Strength During Risk-Off",
-        tags: "wheat,corn,soybeans",
-        body: "Agricultural commodities are priced in US dollars but produced and consumed \
-globally. During VIX spikes, the dollar typically strengthens (flight to safety), creating a \
-headwind for agricultural prices even if the underlying shock has nothing to do with food \
-markets. A 5% dollar rally can push grain prices down 3-5% purely through currency effects. \
-When all three grains decline modestly during a VIX spike with no agricultural-specific news, \
-the dollar is likely the transmission mechanism rather than any change in food supply or \
-demand fundamentals.",
-    },
 ];

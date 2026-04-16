@@ -17,7 +17,6 @@
 use crate::ai::InstrumentSnapshot;
 use crate::knowledge;
 use crate::models::Instrument;
-use std::collections::HashSet;
 
 // ---------------------------------------------------------------------------
 // Public types — always compiled, reusable for runtime pre-flight checks
@@ -25,17 +24,20 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalRule {
-    /// FRED attributed only to VIX; Alpha Vantage for all commodities including Soybeans.
+    /// FRED attributed only to VIX; Alpha Vantage for all commodities.
     GroundTruthSources,
-    /// "Instruments in view" in the user message lists exactly the selected instruments.
-    PrimarySubjectMatch,
-    /// Every selected instrument appears in the "Latest closes" block.
-    SelectedInLatestCloses,
+    /// User message contains a "Primary instrument: <name>" line naming the expected primary.
+    PrimaryNamed,
+    /// Primary appears in the "Latest close" block; secondaries and tertiaries do not.
+    PrimaryInLatestClose,
+    /// When secondary is non-empty: "Secondary instruments" block present, contains exactly
+    /// those instruments, and carries the corroborative-framing header. Empty secondary: no block.
+    SecondaryFraming,
     /// Unselected instruments appear under "Other available instruments" with TERTIARY warning.
     UnselectedTertiaryFraming,
-    /// Selected instruments must NOT appear in the tertiary block.
+    /// Primary and secondary instruments must NOT appear in the tertiary block.
     NoSelectedInTertiary,
-    /// Unselected instruments must NOT appear in the "Latest closes" block.
+    /// Unselected instruments must NOT appear in the "Latest close" block.
     NoUnselectedInPrimary,
     /// Knowledge chunks include tags for each selected instrument.
     KnowledgeRelevance,
@@ -54,11 +56,26 @@ pub struct EvalResult {
 
 pub struct EvalScenario {
     pub name: &'static str,
-    pub selected: Vec<Instrument>,
+    /// The one instrument chosen as the hypothesis subject.
+    pub primary: Instrument,
+    /// Other selected instruments (corroborative only). Empty when the
+    /// user had a single-select.
+    pub secondary: Vec<Instrument>,
     pub system_prompt: String,
     pub user_message: String,
     /// Storage keys of selected instruments (for knowledge relevance checks).
     pub knowledge_tags: Vec<String>,
+}
+
+impl EvalScenario {
+    /// Convenience: union of primary + secondary. Used by checks that
+    /// still need to treat the full selection as a single set.
+    fn selected(&self) -> Vec<Instrument> {
+        let mut out = Vec::with_capacity(self.secondary.len() + 1);
+        out.push(self.primary);
+        out.extend_from_slice(&self.secondary);
+        out
+    }
 }
 
 impl EvalResult {
@@ -92,11 +109,11 @@ fn extract_tertiary_block(text: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Extract the system prompt instruction prefix (before the KNOWLEDGE BASE section).
-/// Uses the section divider `"---\nKNOWLEDGE BASE"` to avoid matching the inline
-/// mention in the three-tier instructions.
+/// Extract the system prompt instruction prefix (before the KNOWLEDGE
+/// LIBRARY section). Uses the section divider `"---\nKNOWLEDGE LIBRARY"`
+/// to avoid matching the inline mention in the three-tier instructions.
 fn system_prompt_prefix(text: &str) -> &str {
-    text.find("---\nKNOWLEDGE BASE")
+    text.find("---\nKNOWLEDGE LIBRARY")
         .map(|i| &text[..i])
         .unwrap_or(text)
 }
@@ -116,67 +133,112 @@ fn unselected_instruments(selected: &[Instrument]) -> Vec<Instrument> {
 
 fn check_ground_truth_sources(s: &EvalScenario) -> EvalResult {
     let rule = EvalRule::GroundTruthSources;
-    let expected = "FRED (VIX) and Alpha Vantage (all commodities including Soybeans)";
+    let expected = "FRED (VIX) and Alpha Vantage (gold, silver, bitcoin, crude oil, natural gas)";
     if s.system_prompt.contains(expected) {
         EvalResult::pass(rule)
     } else {
-        // Detect the specific regression: Soybeans attributed to FRED
-        let prefix = system_prompt_prefix(&s.system_prompt);
-        if prefix.contains("FRED (VIX, Soybeans)")
-            || prefix.contains("FRED (VIX and Soybeans)")
-        {
-            EvalResult::fail(
-                rule,
-                "Soybeans is attributed to FRED instead of Alpha Vantage".into(),
-            )
-        } else {
-            EvalResult::fail(rule, format!("Expected exact phrase: \"{expected}\""))
-        }
+        EvalResult::fail(rule, format!("Expected exact phrase: \"{expected}\""))
     }
 }
 
-fn check_primary_subject_match(s: &EvalScenario) -> EvalResult {
-    let rule = EvalRule::PrimarySubjectMatch;
-    let marker = "**Instruments in view**: ";
+fn check_primary_named(s: &EvalScenario) -> EvalResult {
+    let rule = EvalRule::PrimaryNamed;
+    let marker = "**Primary instrument**: ";
     let Some(start) = s.user_message.find(marker) else {
-        return EvalResult::fail(rule, "Missing 'Instruments in view' section".into());
+        return EvalResult::fail(rule, "Missing 'Primary instrument' line".into());
     };
     let after = start + marker.len();
     let rest = &s.user_message[after..];
     let end = rest.find('\n').unwrap_or(rest.len());
-    let instruments_text = rest[..end].trim();
+    let named = rest[..end].trim();
 
-    let found: HashSet<&str> = instruments_text.split(", ").collect();
-    let expected: HashSet<&str> = s.selected.iter().map(|i| i.as_str()).collect();
-
-    if found == expected {
+    if named == s.primary.as_str() {
         EvalResult::pass(rule)
     } else {
-        EvalResult::fail(rule, format!("Expected {expected:?}, found {found:?}"))
+        EvalResult::fail(
+            rule,
+            format!(
+                "Expected primary '{}', user message names '{}'",
+                s.primary.as_str(),
+                named
+            ),
+        )
     }
 }
 
-fn check_selected_in_latest_closes(s: &EvalScenario) -> EvalResult {
-    let rule = EvalRule::SelectedInLatestCloses;
-    let Some(block) = extract_block(&s.user_message, "**Latest closes") else {
-        return EvalResult::fail(rule, "Missing 'Latest closes' block".into());
+fn check_primary_in_latest_close(s: &EvalScenario) -> EvalResult {
+    let rule = EvalRule::PrimaryInLatestClose;
+    let Some(block) = extract_block(&s.user_message, "**Latest close") else {
+        return EvalResult::fail(rule, "Missing 'Latest close' block".into());
     };
+    if !block.contains(s.primary.as_str()) {
+        return EvalResult::fail(
+            rule,
+            format!("Primary '{}' missing from 'Latest close' block", s.primary.as_str()),
+        );
+    }
+    let leaked: Vec<&str> = s
+        .secondary
+        .iter()
+        .filter(|i| block.contains(i.as_str()))
+        .map(|i| i.as_str())
+        .collect();
+    if !leaked.is_empty() {
+        return EvalResult::fail(
+            rule,
+            format!("Secondary instruments leaked into 'Latest close': {leaked:?}"),
+        );
+    }
+    EvalResult::pass(rule)
+}
+
+fn check_secondary_framing(s: &EvalScenario) -> EvalResult {
+    let rule = EvalRule::SecondaryFraming;
+    let block = extract_block(&s.user_message, "**Secondary instruments");
+
+    if s.secondary.is_empty() {
+        if block.is_some() {
+            return EvalResult::fail(
+                rule,
+                "Single-select run but 'Secondary instruments' block is present".into(),
+            );
+        }
+        return EvalResult::pass(rule);
+    }
+
+    let Some(block) = block else {
+        return EvalResult::fail(
+            rule,
+            "Multi-select run but 'Secondary instruments' block is missing".into(),
+        );
+    };
+
+    if !block.contains("corroborative") {
+        return EvalResult::fail(
+            rule,
+            "'Secondary instruments' block missing corroborative-framing header".into(),
+        );
+    }
+
     let missing: Vec<&str> = s
-        .selected
+        .secondary
         .iter()
         .filter(|i| !block.contains(i.as_str()))
         .map(|i| i.as_str())
         .collect();
-    if missing.is_empty() {
-        EvalResult::pass(rule)
-    } else {
-        EvalResult::fail(rule, format!("Missing from Latest closes: {missing:?}"))
+    if !missing.is_empty() {
+        return EvalResult::fail(
+            rule,
+            format!("Secondary instruments missing from block: {missing:?}"),
+        );
     }
+    EvalResult::pass(rule)
 }
 
 fn check_unselected_tertiary_framing(s: &EvalScenario) -> EvalResult {
     let rule = EvalRule::UnselectedTertiaryFraming;
-    let unselected = unselected_instruments(&s.selected);
+    let selected = s.selected();
+    let unselected = unselected_instruments(&selected);
 
     if unselected.is_empty() {
         return EvalResult::pass(rule);
@@ -213,8 +275,8 @@ fn check_no_selected_in_tertiary(s: &EvalScenario) -> EvalResult {
     let Some(block) = extract_tertiary_block(&s.user_message) else {
         return EvalResult::pass(rule);
     };
-    let leaked: Vec<&str> = s
-        .selected
+    let selected = s.selected();
+    let leaked: Vec<&str> = selected
         .iter()
         .filter(|i| block.contains(i.as_str()))
         .map(|i| i.as_str())
@@ -224,17 +286,18 @@ fn check_no_selected_in_tertiary(s: &EvalScenario) -> EvalResult {
     } else {
         EvalResult::fail(
             rule,
-            format!("Selected instruments leaked into tertiary: {leaked:?}"),
+            format!("Primary or secondary leaked into tertiary: {leaked:?}"),
         )
     }
 }
 
 fn check_no_unselected_in_primary(s: &EvalScenario) -> EvalResult {
     let rule = EvalRule::NoUnselectedInPrimary;
-    let Some(block) = extract_block(&s.user_message, "**Latest closes") else {
-        return EvalResult::fail(rule, "Missing 'Latest closes' block".into());
+    let Some(block) = extract_block(&s.user_message, "**Latest close") else {
+        return EvalResult::fail(rule, "Missing 'Latest close' block".into());
     };
-    let unselected = unselected_instruments(&s.selected);
+    let selected = s.selected();
+    let unselected = unselected_instruments(&selected);
     let leaked: Vec<&str> = unselected
         .iter()
         .filter(|i| block.contains(i.as_str()))
@@ -245,7 +308,7 @@ fn check_no_unselected_in_primary(s: &EvalScenario) -> EvalResult {
     } else {
         EvalResult::fail(
             rule,
-            format!("Unselected instruments in Latest closes: {leaked:?}"),
+            format!("Unselected instruments in 'Latest close': {leaked:?}"),
         )
     }
 }
@@ -303,11 +366,6 @@ fn check_no_hardcoded_subject(s: &EvalScenario) -> EvalResult {
         "Bitcoin",
         "Crude Oil",
         "Natural Gas",
-        "Copper",
-        "Aluminum",
-        "Wheat",
-        "Corn",
-        "Soybeans",
     ];
 
     // Patterns that indicate a commodity is hardcoded as a hypothesis subject.
@@ -348,21 +406,6 @@ fn check_source_attribution_consistent(s: &EvalScenario) -> EvalResult {
     let rule = EvalRule::SourceAttributionConsistent;
     let prefix = system_prompt_prefix(&s.system_prompt);
 
-    // Stale attribution patterns from before the Soybeans migration.
-    let stale_patterns = [
-        "FRED (VIX, Soybeans)",
-        "FRED (VIX and Soybeans)",
-        "FRED PSOYBUSDM",
-    ];
-    for pattern in &stale_patterns {
-        if prefix.contains(pattern) {
-            return EvalResult::fail(
-                rule,
-                format!("Found stale FRED attribution: '{pattern}'"),
-            );
-        }
-    }
-
     // FRED must still be mentioned (for VIX).
     if !prefix.contains("FRED") {
         return EvalResult::fail(rule, "FRED not mentioned in source attribution".into());
@@ -378,8 +421,9 @@ fn check_source_attribution_consistent(s: &EvalScenario) -> EvalResult {
 pub fn run_all_checks(scenario: &EvalScenario) -> Vec<EvalResult> {
     vec![
         check_ground_truth_sources(scenario),
-        check_primary_subject_match(scenario),
-        check_selected_in_latest_closes(scenario),
+        check_primary_named(scenario),
+        check_primary_in_latest_close(scenario),
+        check_secondary_framing(scenario),
         check_unselected_tertiary_framing(scenario),
         check_no_selected_in_tertiary(scenario),
         check_no_unselected_in_primary(scenario),
@@ -620,53 +664,62 @@ pub fn validate_response(scenario: &ResponseScenario) -> Vec<ResponseValidation>
 /// analysis response, then validates against five semantic rules. Output is
 /// structured for machine parsing.
 pub fn assemble_bias_judge_prompt(
-    selected: &[Instrument],
+    primary: Instrument,
+    secondary: &[Instrument],
     snapshots: &[InstrumentSnapshot],
     response: &str,
 ) -> (String, String) {
     let system = "\
 You are a quality-control validator for a macro-financial analysis system. You will receive \
-the user's selected instruments, authoritative latest prices, and an AI-generated analysis \
-to validate.
+the PRIMARY instrument (the hypothesis subject), any SECONDARY instruments (corroborative only), \
+authoritative latest prices, and an AI-generated analysis to validate.
 
 Check the analysis against these five rules. Be strict.
 
 RULES:
 
-1. SUBJECT_MATCH: The hypothesis MUST be about the selected instruments. If the user \
-selected Soybeans, the hypothesis must be about Soybeans — not Gold, not Crude Oil. \
-An instrument is 'the subject' if it is the grammatical subject of the hypothesis \
-statement and the instrument whose price action is being predicted.
+1. SUBJECT_MATCH: The hypothesis subject is exactly the PRIMARY instrument. Not a SECONDARY, \
+not a TERTIARY. An instrument is 'the subject' if it is the grammatical subject of the \
+hypothesis statement and the instrument whose price action is being predicted.
 
-2. PRICE_ANCHORING: Any specific dollar price cited in the hypothesis or outcome bands \
-MUST be consistent with the provided latest closes (within ~10%). The model must not \
-have substituted stale training-data prices (e.g. citing gold at $2,000 when the latest \
-close is $4,624).
+2. PRICE_ANCHORING: Any specific dollar price cited in the hypothesis or outcome bands MUST \
+be consistent with the PRIMARY's latest close (within ~10%). The model must not have \
+substituted stale training-data prices. SECONDARY prices may be mentioned for context but \
+are never the strike level.
 
-3. MECHANISM_RELEVANCE: The causal mechanism in the Hypothesis Context must be specific \
-to the selected instruments — not generic macro filler. For example, if the user selected \
-Corn, the mechanism should reference ethanol linkage, USDA reports, or crop conditions, \
-not just 'monetary policy'.
+3. MECHANISM_RELEVANCE: The causal mechanism in the Hypothesis Context must be specific to \
+the PRIMARY — not generic macro filler. SECONDARY instruments may appear as corroborative \
+evidence but must not drive the mechanism narrative. For example, if PRIMARY is Gold, the \
+mechanism should reference real rates / flight-to-safety / dollar dynamics, not just \
+'monetary policy'.
 
-4. TERTIARY_BOUNDARY: Instruments NOT in the user's selection may appear for supporting \
-context but must NOT be the subject of the hypothesis or any outcome band.
+4. SECONDARY_FRAMING: SECONDARY instruments are named in context as corroborative or \
+challenging — never as subject. TERTIARY instruments (those not in the user's selection) \
+are background only, and only if they materially support or contradict the primary thesis. \
+No SECONDARY or TERTIARY instrument may appear as the grammatical subject of the \
+hypothesis or any outcome band.
 
-5. OUTCOME_ALIGNMENT: Each outcome band must reference the selected instruments' price \
-levels and represent a distinct causal path (not just the same outcome at different \
-thresholds).
+5. OUTCOME_ALIGNMENT: Each outcome band references the PRIMARY's price level and represents \
+a distinct causal path (not the same outcome at different thresholds).
 
 RESPOND IN EXACTLY THIS FORMAT (no other text):
 SUBJECT_MATCH: PASS|FAIL — [one sentence reason]
 PRICE_ANCHORING: PASS|FAIL — [one sentence reason]
 MECHANISM_RELEVANCE: PASS|FAIL — [one sentence reason]
-TERTIARY_BOUNDARY: PASS|FAIL — [one sentence reason]
+SECONDARY_FRAMING: PASS|FAIL — [one sentence reason]
 OUTCOME_ALIGNMENT: PASS|FAIL — [one sentence reason]"
         .to_owned();
 
     let mut user = String::with_capacity(1024);
-    user.push_str("## Selected Instruments\n\n");
-    let names: Vec<&str> = selected.iter().map(|i| i.as_str()).collect();
-    user.push_str(&names.join(", "));
+    user.push_str("## Primary Instrument (hypothesis subject)\n\n");
+    user.push_str(primary.as_str());
+    user.push_str("\n\n## Secondary Instruments (corroborative only)\n\n");
+    if secondary.is_empty() {
+        user.push_str("(none — single-select run)");
+    } else {
+        let names: Vec<&str> = secondary.iter().map(|i| i.as_str()).collect();
+        user.push_str(&names.join(", "));
+    }
     user.push_str("\n\n## Authoritative Latest Closes\n\n");
     for snap in snapshots {
         if let Some(close) = snap.latest_close {
@@ -686,7 +739,7 @@ pub fn parse_bias_judge(response: &str) -> Vec<ResponseValidation> {
         "SUBJECT_MATCH",
         "PRICE_ANCHORING",
         "MECHANISM_RELEVANCE",
-        "TERTIARY_BOUNDARY",
+        "SECONDARY_FRAMING",
         "OUTCOME_ALIGNMENT",
     ];
 
@@ -753,11 +806,6 @@ mod tests {
                     Instrument::Bitcoin => "Alpha Vantage BTC",
                     Instrument::CrudeOil => "Alpha Vantage WTI",
                     Instrument::NaturalGas => "Alpha Vantage NATURAL_GAS",
-                    Instrument::Copper => "Alpha Vantage COPPER",
-                    Instrument::Aluminum => "Alpha Vantage ALUMINUM",
-                    Instrument::Wheat => "Alpha Vantage WHEAT",
-                    Instrument::Corn => "Alpha Vantage CORN",
-                    Instrument::Soybeans => "Alpha Vantage SOYBEANS",
                 },
             })
             .collect()
@@ -795,22 +843,17 @@ mod tests {
             Instrument::Bitcoin => 97500.0,
             Instrument::CrudeOil => 72.50,
             Instrument::NaturalGas => 3.450,
-            Instrument::Copper => 4.850,
-            Instrument::Aluminum => 2650.0,
-            Instrument::Wheat => 5.800,
-            Instrument::Corn => 4.500,
-            Instrument::Soybeans => 10.250,
         }
     }
 
-    /// Build an `EvalScenario` from a set of selected instruments + VIX level.
-    ///
-    /// Seeds knowledge into in-memory SQLite, generates synthetic series for
-    /// every instrument, and calls the real `assemble_system_prompt` /
-    /// `assemble_user_message` functions.
+    /// Build an `EvalScenario` with an explicit primary and optional
+    /// secondary instruments. Seeds knowledge into in-memory SQLite,
+    /// generates synthetic series, and calls the real
+    /// `assemble_system_prompt` / `assemble_user_message` functions.
     fn build_scenario(
         name: &'static str,
-        selected: &[Instrument],
+        primary: Instrument,
+        secondary: &[Instrument],
         vix_close: f64,
     ) -> EvalScenario {
         let storage = Storage::open_memory().expect("in-memory storage");
@@ -823,49 +866,60 @@ mod tests {
             )
             .expect("seed knowledge");
 
+        let mut selected = vec![primary];
+        selected.extend_from_slice(secondary);
         let instrument_tags: Vec<&str> =
             selected.iter().map(|i| i.storage_key()).collect();
         let knowledge_chunks =
             knowledge::retrieve_for_context(&storage, &instrument_tags);
 
-        let instrument_snapshots: Vec<InstrumentSnapshot> = selected
+        let primary_snapshot = InstrumentSnapshot::from_series(
+            primary,
+            &synthetic_series(primary, representative_price(primary), 60),
+        );
+        let secondary_snapshots: Vec<InstrumentSnapshot> = secondary
             .iter()
             .map(|&inst| {
-                let series =
-                    synthetic_series(inst, representative_price(inst), 60);
-                InstrumentSnapshot::from_series(inst, &series)
+                InstrumentSnapshot::from_series(
+                    inst,
+                    &synthetic_series(inst, representative_price(inst), 60),
+                )
             })
             .collect();
 
-        let unselected: Vec<Instrument> = Instrument::ALL
+        let tertiary: Vec<Instrument> = Instrument::ALL
             .iter()
             .copied()
             .filter(|i| *i != Instrument::Vix && !selected.contains(i))
             .collect();
-        let unselected_snapshots: Vec<InstrumentSnapshot> = unselected
+        let tertiary_snapshots: Vec<InstrumentSnapshot> = tertiary
             .iter()
             .map(|&inst| {
-                let series =
-                    synthetic_series(inst, representative_price(inst), 60);
-                InstrumentSnapshot::from_series(inst, &series)
+                InstrumentSnapshot::from_series(
+                    inst,
+                    &synthetic_series(inst, representative_price(inst), 60),
+                )
             })
             .collect();
 
         let vix_status = synthetic_vix(vix_close);
         let spike_episodes: Vec<SpikeEpisode> = Vec::new();
 
-        let system_prompt = ai::assemble_system_prompt(&knowledge_chunks);
+        let system_prompt = ai::assemble_system_prompt(&knowledge_chunks, None);
         let user_message = ai::assemble_user_message(
             Some(&vix_status),
-            selected,
-            &instrument_snapshots,
-            &unselected_snapshots,
+            primary,
+            secondary,
+            &primary_snapshot,
+            &secondary_snapshots,
+            &tertiary_snapshots,
             &spike_episodes,
         );
 
         EvalScenario {
             name,
-            selected: selected.to_vec(),
+            primary,
+            secondary: secondary.to_vec(),
             system_prompt,
             user_message,
             knowledge_tags: instrument_tags
@@ -879,8 +933,7 @@ mod tests {
 
     #[test]
     fn eval_single_gold() {
-        let scenario =
-            build_scenario("single_gold", &[Instrument::Gold], 18.2);
+        let scenario = build_scenario("single_gold", Instrument::Gold, &[], 18.2);
         let results = run_all_checks(&scenario);
         for r in &results {
             assert!(
@@ -895,7 +948,8 @@ mod tests {
     fn eval_metals_basket() {
         let scenario = build_scenario(
             "metals_basket",
-            &[Instrument::Gold, Instrument::Silver, Instrument::Copper],
+            Instrument::Gold,
+            &[Instrument::Silver],
             25.0,
         );
         let results = run_all_checks(&scenario);
@@ -909,9 +963,8 @@ mod tests {
     }
 
     #[test]
-    fn eval_soybeans_only() {
-        let scenario =
-            build_scenario("soybeans_only", &[Instrument::Soybeans], 15.0);
+    fn eval_bitcoin_only() {
+        let scenario = build_scenario("bitcoin_only", Instrument::Bitcoin, &[], 15.0);
         let results = run_all_checks(&scenario);
         for r in &results {
             assert!(
@@ -923,15 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn eval_energy_agriculture_mix() {
+    fn eval_energy_mix() {
         let scenario = build_scenario(
-            "energy_agriculture_mix",
-            &[
-                Instrument::CrudeOil,
-                Instrument::NaturalGas,
-                Instrument::Wheat,
-                Instrument::Corn,
-            ],
+            "energy_mix",
+            Instrument::CrudeOil,
+            &[Instrument::NaturalGas],
             30.0,
         );
         let results = run_all_checks(&scenario);
@@ -944,21 +993,49 @@ mod tests {
         }
     }
 
-    // -- Targeted regression checks -----------------------------------------
+    #[test]
+    fn eval_default_trio() {
+        // The default sidebar load — Gold/Silver/Bitcoin — with the
+        // user having picked Gold as primary. This is the case the
+        // primary/secondary/tertiary refactor was designed to handle.
+        let scenario = build_scenario(
+            "default_trio",
+            Instrument::Gold,
+            &[Instrument::Silver, Instrument::Bitcoin],
+            22.0,
+        );
+        let results = run_all_checks(&scenario);
+        for r in &results {
+            assert!(
+                r.pass,
+                "FAIL [{}] {:?} — {}",
+                scenario.name, r.rule, r.reason
+            );
+        }
+    }
 
     #[test]
-    fn soybeans_not_attributed_to_fred() {
-        let scenario = build_scenario(
-            "soybeans_regression",
-            &[Instrument::Soybeans],
-            15.0,
+    fn secondary_framing_fails_when_block_missing() {
+        // Regression: if the user message loses the 'Secondary
+        // instruments' block but secondary is non-empty, the check must
+        // flag it. We simulate by hand-editing the user_message post hoc.
+        let mut scenario = build_scenario(
+            "secondary_missing",
+            Instrument::Gold,
+            &[Instrument::Silver],
+            20.0,
         );
-        let result = check_ground_truth_sources(&scenario);
-        assert!(
-            result.pass,
-            "Soybeans attribution regression: {}",
-            result.reason
-        );
+        // Strip the block — everything from the Secondary header to the
+        // next blank line.
+        if let Some(start) = scenario.user_message.find("**Secondary instruments") {
+            let rest = &scenario.user_message[start..];
+            if let Some(end_rel) = rest.find("\n\n") {
+                let end = start + end_rel + 2;
+                scenario.user_message.replace_range(start..end, "");
+            }
+        }
+        let result = check_secondary_framing(&scenario);
+        assert!(!result.pass, "Should fail when Secondary block is absent");
     }
 
     // -- Response validation tests ------------------------------------------
@@ -1001,23 +1078,23 @@ mod tests {
     #[test]
     fn response_wrong_instrument_subject() {
         let scenario = make_response_scenario(
-            &[Instrument::Soybeans],
+            &[Instrument::Bitcoin],
             "Gold will hold above $4,600 through May as safe-haven \
              demand persists.",
             &["Holds above $4,600 — safe haven"],
         );
         let results = validate_response(&scenario);
         let subject = results.iter().find(|r| r.rule == "HypothesisNamesSelected").unwrap();
-        assert!(!subject.pass, "Should fail: hypothesis is about Gold, not Soybeans");
+        assert!(!subject.pass, "Should fail: hypothesis is about Gold, not Bitcoin");
     }
 
     #[test]
     fn response_unselected_as_subject() {
         let scenario = make_response_scenario(
-            &[Instrument::Soybeans],
-            "Soybeans will hold near $10 but Gold will spike above \
+            &[Instrument::Bitcoin],
+            "Bitcoin will hold near $97,500 but Gold will spike above \
              $5,000 through June.",
-            &["Soybeans holds $10", "Gold spikes $5,000"],
+            &["Bitcoin holds $97,500", "Gold spikes $5,000"],
         );
         let results = validate_response(&scenario);
         let unsub = results.iter().find(|r| r.rule == "NoUnselectedAsSubject").unwrap();
@@ -1071,7 +1148,7 @@ mod tests {
 SUBJECT_MATCH: PASS — Hypothesis correctly targets Gold.
 PRICE_ANCHORING: PASS — $4,600 is within range of $4,624.50 close.
 MECHANISM_RELEVANCE: PASS — Real-rate compression is specific to gold dynamics.
-TERTIARY_BOUNDARY: PASS — No unselected instruments appear as subjects.
+SECONDARY_FRAMING: PASS — No unselected instruments appear as subjects.
 OUTCOME_ALIGNMENT: PASS — Three distinct causal paths with appropriate levels.";
 
         let results = parse_bias_judge(response);
@@ -1082,10 +1159,10 @@ OUTCOME_ALIGNMENT: PASS — Three distinct causal paths with appropriate levels.
     #[test]
     fn parse_judge_with_failure() {
         let response = "\
-SUBJECT_MATCH: FAIL — Hypothesis is about Crude Oil but user selected Soybeans.
+SUBJECT_MATCH: FAIL — Hypothesis is about Crude Oil but user selected Bitcoin.
 PRICE_ANCHORING: PASS — Prices match latest closes.
-MECHANISM_RELEVANCE: FAIL — Generic macro commentary, not soybean-specific.
-TERTIARY_BOUNDARY: PASS — Non-selected instruments are background only.
+MECHANISM_RELEVANCE: FAIL — Generic macro commentary, not bitcoin-specific.
+SECONDARY_FRAMING: PASS — Non-selected instruments are background only.
 OUTCOME_ALIGNMENT: PASS — Outcomes are distinct.";
 
         let results = parse_bias_judge(response);

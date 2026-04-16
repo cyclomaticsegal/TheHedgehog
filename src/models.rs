@@ -7,19 +7,13 @@ pub enum AssetGroup {
     Volatility,
     Monetary,
     Energy,
-    Industrial,
-    Agriculture,
-    Risk,
 }
 
 impl AssetGroup {
-    pub const ALL: [AssetGroup; 6] = [
+    pub const ALL: [AssetGroup; 3] = [
         AssetGroup::Volatility,
         AssetGroup::Monetary,
         AssetGroup::Energy,
-        AssetGroup::Industrial,
-        AssetGroup::Agriculture,
-        AssetGroup::Risk,
     ];
 
     pub fn label(self) -> &'static str {
@@ -27,9 +21,6 @@ impl AssetGroup {
             Self::Volatility => "Volatility",
             Self::Monetary => "Monetary / Store of Value",
             Self::Energy => "Energy",
-            Self::Industrial => "Industrial Metals",
-            Self::Agriculture => "Agriculture",
-            Self::Risk => "Risk / Alternative",
         }
     }
 }
@@ -42,26 +33,16 @@ pub enum Instrument {
     Bitcoin,
     CrudeOil,
     NaturalGas,
-    Copper,
-    Aluminum,
-    Wheat,
-    Corn,
-    Soybeans,
 }
 
 impl Instrument {
-    pub const ALL: [Instrument; 11] = [
+    pub const ALL: [Instrument; 6] = [
         Instrument::Vix,
         Instrument::Gold,
         Instrument::Silver,
         Instrument::Bitcoin,
         Instrument::CrudeOil,
         Instrument::NaturalGas,
-        Instrument::Copper,
-        Instrument::Aluminum,
-        Instrument::Wheat,
-        Instrument::Corn,
-        Instrument::Soybeans,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -72,11 +53,6 @@ impl Instrument {
             Self::Bitcoin => "Bitcoin",
             Self::CrudeOil => "Crude Oil",
             Self::NaturalGas => "Natural Gas",
-            Self::Copper => "Copper",
-            Self::Aluminum => "Aluminum",
-            Self::Wheat => "Wheat",
-            Self::Corn => "Corn",
-            Self::Soybeans => "Soybeans",
         }
     }
 
@@ -88,22 +64,14 @@ impl Instrument {
             Self::Bitcoin => "bitcoin",
             Self::CrudeOil => "crude_oil",
             Self::NaturalGas => "natural_gas",
-            Self::Copper => "copper",
-            Self::Aluminum => "aluminum",
-            Self::Wheat => "wheat",
-            Self::Corn => "corn",
-            Self::Soybeans => "soybeans",
         }
     }
 
     pub fn group_members(group: AssetGroup) -> &'static [Instrument] {
         match group {
             AssetGroup::Volatility => &[Instrument::Vix],
-            AssetGroup::Monetary => &[Instrument::Gold, Instrument::Silver],
+            AssetGroup::Monetary => &[Instrument::Gold, Instrument::Silver, Instrument::Bitcoin],
             AssetGroup::Energy => &[Instrument::CrudeOil, Instrument::NaturalGas],
-            AssetGroup::Industrial => &[Instrument::Copper, Instrument::Aluminum],
-            AssetGroup::Agriculture => &[Instrument::Wheat, Instrument::Corn, Instrument::Soybeans],
-            AssetGroup::Risk => &[Instrument::Bitcoin],
         }
     }
 }
@@ -469,11 +437,13 @@ pub const FOLDS_STATUS_UNDISCLOSED_FAILURE: &str = "undisclosed_failure";
 
 /// "Suspect" is a derived status — never persisted. A model is suspect when
 /// it is still `pending` and has been alive for more than this duration.
-/// Advanced-tier models typically complete in 25-30 minutes.
-pub const FOLDS_SUSPECT_AFTER_SECS: i64 = 25 * 60; // 25 minutes
+/// Advanced-tier builds in practice take 45-75 minutes (observed
+/// 2026-04-16), so 60 minutes is the "this is taking a while" threshold.
+pub const FOLDS_SUSPECT_AFTER_SECS: i64 = 60 * 60; // 60 minutes
 /// Pending models older than this are marked as `undisclosed_failure` and
-/// polling stops. Advanced models should complete well within 35 minutes.
-pub const FOLDS_UNDISCLOSED_AFTER_SECS: i64 = 35 * 60; // 35 minutes
+/// polling stops. Two hours gives enough headroom for legitimate long
+/// builds while still cutting off anything genuinely stuck.
+pub const FOLDS_UNDISCLOSED_AFTER_SECS: i64 = 120 * 60; // 2 hours
 
 /// One row of the `folds_models` table — a 51Folds model the app has asked
 /// to be created, with whatever status we last observed.
@@ -487,6 +457,7 @@ pub struct FoldsModelRecord {
     pub completed_at: Option<DateTime<Utc>>,
     pub last_polled_at: Option<DateTime<Utc>>,
     pub question: String,
+    pub inference_id: Option<i64>,
 }
 
 impl FoldsModelRecord {

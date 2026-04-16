@@ -15,7 +15,7 @@ use chrono::Utc;
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Vec2,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -198,6 +198,16 @@ struct FoldsTask {
     refresh_in_flight: bool,
     refresh_rx: Option<Receiver<FoldsResult>>,
     refresh_error: Option<String>,
+    /// Short hypothesis label for the tray / backlog popover. Set when a
+    /// build is spawned or resumed; never used for anything other than
+    /// display.
+    question: Option<String>,
+    /// When the build was spawned (or resumed). Drives the tray elapsed
+    /// time readout.
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Originating inference row. Used to update the sidebar/Report
+    /// status badge map live as builds complete.
+    inference_id: Option<i64>,
 }
 
 impl FoldsTask {
@@ -214,6 +224,9 @@ impl FoldsTask {
             refresh_in_flight: false,
             refresh_rx: None,
             refresh_error: None,
+            question: None,
+            started_at: None,
+            inference_id: None,
         }
     }
 
@@ -229,6 +242,9 @@ impl FoldsTask {
         self.refresh_in_flight = false;
         self.refresh_rx = None;
         self.refresh_error = None;
+        self.question = None;
+        self.started_at = None;
+        self.inference_id = None;
     }
 
     fn start(&mut self, rx: Receiver<FoldsResult>) {
@@ -446,6 +462,224 @@ impl FoldsTask {
     }
 }
 
+/// Holds 51Folds builds that aren't currently in the foreground. See ADR
+/// 0020 for the foreground/backlog split. `background` is keyed by model
+/// ID once the server has returned one; `pending_creates` holds builds
+/// in the brief window between a Create click and the first
+/// `FoldsResult::Created` event.
+struct FoldsBacklog {
+    background: HashMap<String, FoldsTask>,
+    pending_creates: Vec<FoldsTask>,
+}
+
+impl FoldsBacklog {
+    fn new() -> Self {
+        Self {
+            background: HashMap::new(),
+            pending_creates: Vec::new(),
+        }
+    }
+
+    /// Count of builds that are still working. Foreground is counted
+    /// separately by callers — this function only reports the backlog.
+    fn active_count(&self) -> usize {
+        self.background
+            .values()
+            .filter(|t| t.in_flight)
+            .count()
+            + self.pending_creates.iter().filter(|t| t.in_flight).count()
+    }
+
+    /// Park a FoldsTask into the backlog. If it has a model_id, it lives
+    /// in `background`; otherwise it waits in `pending_creates` until
+    /// its model_id arrives via the Created event.
+    fn park(&mut self, task: FoldsTask) {
+        let has_rx = task.rx.is_some();
+        let in_flight = task.in_flight;
+        if let Some(id) = task.model_id.clone() {
+            tracing::info!(
+                model_id = %id,
+                in_flight,
+                has_rx,
+                inference_id = ?task.inference_id,
+                "folds_backlog: park to background"
+            );
+            self.background.insert(id, task);
+        } else {
+            tracing::info!(
+                in_flight,
+                has_rx,
+                inference_id = ?task.inference_id,
+                "folds_backlog: park to pending_creates (no model_id yet)"
+            );
+            self.pending_creates.push(task);
+        }
+    }
+
+    /// Take a parked task back into the foreground by model ID.
+    fn take(&mut self, model_id: &str) -> Option<FoldsTask> {
+        self.background.remove(model_id)
+    }
+
+    /// Drain terminal events from every backlog channel.
+    ///
+    /// Completed/Failed builds stay in `background` with `in_flight =
+    /// false` so the tray and sidebar can reflect them. Pending-creates
+    /// promote into `background` the moment they receive a model ID
+    /// (via either `Created` or `Completed`).
+    ///
+    /// Returns the list of inference IDs whose state changed, so the
+    /// caller can refresh the sidebar/Report status badge map live.
+    fn poll_all(&mut self) -> Vec<i64> {
+        let mut touched: Vec<i64> = Vec::new();
+
+        // Pending-creates pass: drain each task's channel once, and
+        // decide whether the task moves to `background` or stays in
+        // `pending_creates`.
+        let parked = std::mem::take(&mut self.pending_creates);
+        for mut task in parked {
+            let mut promote_id: Option<String> = None;
+            if let Some(rx) = task.rx.take() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(FoldsResult::Created(id)) => {
+                            task.model_id = Some(id.clone());
+                            if let Some(iid) = task.inference_id {
+                                touched.push(iid);
+                            }
+                            promote_id = Some(id);
+                            // Keep draining — a Completed may have
+                            // arrived right behind Created.
+                            continue;
+                        }
+                        Ok(FoldsResult::Completed(model)) => {
+                            let id = model.model_id.clone();
+                            task.in_flight = false;
+                            task.model_id = Some(id.clone());
+                            task.model = Some(model);
+                            if let Some(iid) = task.inference_id {
+                                touched.push(iid);
+                            }
+                            promote_id = Some(id);
+                            break;
+                        }
+                        Ok(FoldsResult::Failed(e)) => {
+                            task.in_flight = false;
+                            task.error = Some(e);
+                            if let Some(iid) = task.inference_id {
+                                touched.push(iid);
+                            }
+                            break;
+                        }
+                        Ok(FoldsResult::Refreshed(_))
+                        | Ok(FoldsResult::RefreshFailed(_)) => continue,
+                        Err(TryRecvError::Empty) => {
+                            task.rx = Some(rx);
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            tracing::warn!(
+                                inference_id = ?task.inference_id,
+                                "folds_backlog: pending-create channel Disconnected \
+                                 — in_flight flipped false without terminal event"
+                            );
+                            task.in_flight = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            match promote_id {
+                Some(id) => {
+                    self.background.insert(id, task);
+                }
+                None => {
+                    self.pending_creates.push(task);
+                }
+            }
+        }
+
+        // Background pass: drain each task's channel in place.
+        for task in self.background.values_mut() {
+            let Some(rx) = task.rx.take() else { continue };
+            loop {
+                match rx.try_recv() {
+                    Ok(FoldsResult::Created(_)) => continue,
+                    Ok(FoldsResult::Completed(model)) => {
+                        task.in_flight = false;
+                        task.model_id = Some(model.model_id.clone());
+                        task.model = Some(model);
+                        if let Some(iid) = task.inference_id {
+                            touched.push(iid);
+                        }
+                        break; // channel's work is done
+                    }
+                    Ok(FoldsResult::Failed(e)) => {
+                        task.in_flight = false;
+                        task.error = Some(e);
+                        if let Some(iid) = task.inference_id {
+                            touched.push(iid);
+                        }
+                        break;
+                    }
+                    Ok(FoldsResult::Refreshed(_))
+                    | Ok(FoldsResult::RefreshFailed(_)) => continue,
+                    Err(TryRecvError::Empty) => {
+                        task.rx = Some(rx);
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        tracing::warn!(
+                            model_id = ?task.model_id,
+                            inference_id = ?task.inference_id,
+                            "folds_backlog: background channel Disconnected \
+                             — in_flight flipped false without terminal event"
+                        );
+                        task.in_flight = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        touched
+    }
+}
+
+/// One row in the toolbar tray popover. Built from a `FoldsTask`
+/// snapshot without borrowing across the popup closure.
+struct TrayRow {
+    question: Option<String>,
+    model_id: Option<String>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    is_foreground: bool,
+}
+
+impl TrayRow {
+    fn from_task(task: &FoldsTask, is_foreground: bool) -> Self {
+        Self {
+            question: task.question.clone(),
+            model_id: task.model_id.clone(),
+            started_at: task.started_at,
+            is_foreground,
+        }
+    }
+
+    fn elapsed_label(&self) -> String {
+        let Some(started) = self.started_at else {
+            return "just now".to_owned();
+        };
+        let elapsed_secs = (chrono::Utc::now() - started).num_seconds().max(0);
+        if elapsed_secs < 60 {
+            format!("{elapsed_secs}s")
+        } else if elapsed_secs < 3600 {
+            format!("{}m {}s", elapsed_secs / 60, elapsed_secs % 60)
+        } else {
+            format!("{}h {}m", elapsed_secs / 3600, (elapsed_secs % 3600) / 60)
+        }
+    }
+}
+
 /// State for the embedded Dexter research-agent terminal.
 struct ResearchTerminal {
     backend: Option<egui_term::TerminalBackend>,
@@ -524,8 +758,6 @@ pub struct DashboardApp {
     ai_panel_open: bool,
     ai_panel_content_height: f32,
     ai_markdown_cache: egui_commonmark::CommonMarkCache,
-    inference_history: Vec<SavedInference>,
-    history_page: usize,
     // Report generation state (Phase 2)
     #[allow(dead_code)]
     show_report_window: bool, // retained for settings persistence compatibility
@@ -535,6 +767,20 @@ pub struct DashboardApp {
     report_task: LlmTask,
     report_result: Option<String>,
     report_markdown_cache: egui_commonmark::CommonMarkCache,
+    /// The inference the user most recently opened from the Report list.
+    /// Persists across navigation so returning from the 51Folds outcome
+    /// view keeps the row highlighted. Cleared whenever the inference
+    /// list is reloaded (new date range ⇒ fresh context).
+    last_selected_report_id: Option<i64>,
+    /// Inference IDs the user has checked for inclusion in the next
+    /// Generate Report call. Empty means "use all loaded". Cleared on
+    /// every reload of the inference list.
+    report_selection: HashSet<i64>,
+    /// Where a ← Back pill should return to from the current central
+    /// view. Set when the user navigates from Report by clicking an
+    /// inference row; cleared on any explicit toolbar navigation or on
+    /// back-pill click.
+    view_back_target: Option<CentralView>,
     // Central panel view mode + navigation stack
     central_view: CentralView,
     model_view: ModelView,
@@ -544,6 +790,11 @@ pub struct DashboardApp {
     parsed_hypothesis: Option<ParsedHypothesis>,
     draft_hypothesis: Option<ParsedHypothesis>,
     folds_task: FoldsTask,
+    /// Builds that aren't currently in the foreground (multiple models
+    /// can build in parallel — ADR 0020). Each has its own rx + model
+    /// and stays here until the user swaps it into the foreground via
+    /// the tray, or it completes and the user never comes back to it.
+    folds_backlog: FoldsBacklog,
     /// The database row ID of the most recent AI inference. Used to link
     /// a 51Folds model back to the analysis that spawned it.
     last_inference_id: Option<i64>,
@@ -565,6 +816,27 @@ pub struct DashboardApp {
     /// If set, a modal confirmation is asking the user to approve
     /// reverting to the original (from the DB baseline).
     revert_to_original_confirm: bool,
+    /// True while the primary-picker modal is showing (triggered when
+    /// the user clicks Analyze with >1 overlay instrument selected).
+    /// ADR: the primary/secondary/tertiary tier refactor.
+    analyze_primary_pending: bool,
+    /// The user's chosen primary instrument for the pending Analyze. Set
+    /// when they confirm the modal; consumed (cleared to None) once the
+    /// analysis request is dispatched, so the next Analyze click starts
+    /// fresh.
+    analyze_primary_choice: Option<Instrument>,
+    /// Primary instrument used by the most recently dispatched analysis.
+    /// Survives until the next dispatch so downstream steps (bias judge,
+    /// response validation) can know which instrument was the subject.
+    last_analysis_primary: Option<Instrument>,
+    /// Secondary instruments that accompanied `last_analysis_primary`.
+    last_analysis_secondary: Vec<Instrument>,
+    /// Failed rules from the last bias judge run (both deterministic and
+    /// LLM judge). Stashed so the next Re-analyze can feed the failure
+    /// reasons back into the system prompt as corrective guidance. Only
+    /// applies when `last_analysis_primary` is unchanged from the run
+    /// that produced these failures.
+    last_bias_failures: Vec<eval::ResponseValidation>,
     /// Maps inference_id → (model_id, status) for showing 51Folds badges
     /// in the history list and report window.
     folds_status_by_inference: std::collections::HashMap<i64, (String, String)>,
@@ -1007,8 +1279,6 @@ impl DashboardApp {
             ai_panel_open: false,
             ai_panel_content_height: 200.0,
             ai_markdown_cache: egui_commonmark::CommonMarkCache::default(),
-            inference_history: Vec::new(),
-            history_page: 0,
             show_report_window: false,
             report_from: String::new(),
             report_to: String::new(),
@@ -1016,18 +1286,27 @@ impl DashboardApp {
             report_task: LlmTask::new(),
             report_result: None,
             report_markdown_cache: egui_commonmark::CommonMarkCache::default(),
+            last_selected_report_id: None,
+            report_selection: HashSet::new(),
+            view_back_target: None,
             central_view: CentralView::Charts,
             model_view: ModelView::Outcome,
             model_view_back: ModelView::DriverList,
             parsed_hypothesis: None,
             draft_hypothesis: None,
             folds_task: FoldsTask::new(),
+            folds_backlog: FoldsBacklog::new(),
             last_inference_id: None,
             outcomes_task: LlmTask::new(),
             splash: SplashState::new(),
             mascot_texture: None,
             reeval_toast_until: None,
             revert_to_original_confirm: false,
+            analyze_primary_pending: false,
+            analyze_primary_choice: None,
+            last_analysis_primary: None,
+            last_analysis_secondary: Vec::new(),
+            last_bias_failures: Vec::new(),
             folds_status_by_inference: std::collections::HashMap::new(),
             stored_window_handle: stored_wh,
             dag_webview: crate::dag::DagWebView::new(),
@@ -1054,7 +1333,7 @@ impl DashboardApp {
                 .map(|c| (c.title, c.tags, c.body))
                 .collect::<Vec<_>>(),
         );
-        app.reload_inference_history();
+        app.reload_folds_status_map();
         app.last_vix_level = app.cached_vix_status.as_ref().map(|s| s.level);
 
         // Resume polling for any 51Folds models that were `pending` when
@@ -1225,7 +1504,7 @@ impl DashboardApp {
             shell: "sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                format!("{exports} && exec bun run start"),
+                format!("{exports} && exec bun run --silent start"),
             ],
             working_directory: Some(dexter_dir),
         };
@@ -1548,8 +1827,59 @@ impl DashboardApp {
         let _ = self.storage.insert_alert_event(&event);
     }
 
+    /// Build the "PRIOR ATTEMPT — BIAS FAILURES TO ADDRESS" block for the
+    /// system prompt, consumed by Re-analyze. Returns `None` when the
+    /// stash is empty or the primary has changed since the failures
+    /// were captured (so we don't feed stale, misaligned guidance to
+    /// the model).
+    fn build_prior_failures_block(
+        &self,
+        current_primary: Instrument,
+    ) -> Option<String> {
+        if self.last_bias_failures.is_empty() {
+            return None;
+        }
+        if self.last_analysis_primary != Some(current_primary) {
+            return None;
+        }
+        let mut block = String::with_capacity(256);
+        block.push_str(
+            "---\nPRIOR ATTEMPT — BIAS FAILURES TO ADDRESS: The last run against this \
+primary was flagged on the rules below. Address each explicitly. Do not \
+repeat these mistakes.\n",
+        );
+        for failure in &self.last_bias_failures {
+            block.push_str(&format!(
+                "- {}: {}\n",
+                failure.rule,
+                failure.reason.trim(),
+            ));
+        }
+        block.push_str(&format!(
+            "Ground the mechanism in {}-specific transmission channels rather \
+than generic macro commentary. Anchor every numeric claim to the PRIMARY's \
+latest close. Keep SECONDARY instruments as corroborative mentions only.\n",
+            current_primary.as_str(),
+        ));
+        Some(block)
+    }
+
     fn start_ai_analysis(&mut self) {
         if self.ai_task.in_flight {
+            return;
+        }
+
+        // Multi-select intent capture: if the user has more than one
+        // overlay instrument selected and hasn't yet picked a primary,
+        // open the primary-picker modal and bail out. The modal's
+        // Analyze-confirm handler re-enters this function with
+        // `analyze_primary_choice` populated.
+        if self.settings.overlay_instruments.len() > 1
+            && self.analyze_primary_choice.is_none()
+        {
+            self.analyze_primary_pending = true;
+            self.analyze_primary_choice =
+                self.settings.overlay_instruments.first().copied();
             return;
         }
 
@@ -1571,6 +1901,32 @@ impl DashboardApp {
             return;
         }
 
+        // Derive primary + secondary. Single-select case: primary is
+        // the one selected instrument, secondary is empty.
+        let primary = match self.analyze_primary_choice {
+            Some(p) if self.settings.overlay_instruments.contains(&p) => p,
+            _ => {
+                // Single-select path, or primary fell out of the
+                // selection between modal confirm and dispatch.
+                match self.settings.overlay_instruments.first().copied() {
+                    Some(p) => p,
+                    None => {
+                        self.ai_task.error =
+                            Some("Select at least one instrument before analyzing.".to_owned());
+                        self.ai_panel_open = true;
+                        return;
+                    }
+                }
+            }
+        };
+        let secondary: Vec<Instrument> = self
+            .settings
+            .overlay_instruments
+            .iter()
+            .copied()
+            .filter(|&i| i != primary)
+            .collect();
+
         // Retrieve knowledge BEFORE spawning (Storage is not Send).
         let instrument_tags: Vec<&str> = self
             .settings
@@ -1583,15 +1939,15 @@ impl DashboardApp {
         // Assemble context from cached analysis state. Snapshots carry the
         // absolute close + date so the LLM has authoritative ground truth and
         // does not fall back on training-data price priors.
-        let instrument_snapshots: Vec<ai::InstrumentSnapshot> = self
-            .settings
-            .overlay_instruments
+        let primary_snapshot =
+            ai::InstrumentSnapshot::from_series(primary, self.series(primary));
+        let secondary_snapshots: Vec<ai::InstrumentSnapshot> = secondary
             .iter()
             .map(|&inst| ai::InstrumentSnapshot::from_series(inst, self.series(inst)))
             .collect();
 
         // Instruments not on the chart — still sent for cross-instrument context.
-        let unselected_snapshots: Vec<ai::InstrumentSnapshot> = Instrument::ALL
+        let tertiary_snapshots: Vec<ai::InstrumentSnapshot> = Instrument::ALL
             .iter()
             .filter(|&&inst| {
                 inst != Instrument::Vix
@@ -1602,12 +1958,31 @@ impl DashboardApp {
 
         let user_message = ai::assemble_user_message(
             self.cached_vix_status.as_ref(),
-            &self.settings.overlay_instruments,
-            &instrument_snapshots,
-            &unselected_snapshots,
+            primary,
+            &secondary,
+            &primary_snapshot,
+            &secondary_snapshots,
+            &tertiary_snapshots,
             &self.cached_spike_episodes,
         );
-        let system_prompt = ai::assemble_system_prompt(&knowledge_chunks);
+
+        // If the last analysis (same primary) had bias failures, feed
+        // them back into the system prompt as a corrective block so the
+        // model can address the specific issues the judge flagged.
+        let prior_block = self.build_prior_failures_block(primary);
+        let system_prompt = ai::assemble_system_prompt(
+            &knowledge_chunks,
+            prior_block.as_deref(),
+        );
+
+        // Consume the primary choice so the next Analyze click starts fresh.
+        // Stash primary + secondary for downstream steps (bias judge).
+        self.analyze_primary_choice = None;
+        self.last_analysis_primary = Some(primary);
+        self.last_analysis_secondary = secondary.clone();
+        // Clear stashed failures — they've been fed into this run's prompt;
+        // the judge will repopulate if new ones emerge.
+        self.last_bias_failures.clear();
 
         let request = ai::AiRequest {
             provider,
@@ -1783,8 +2158,19 @@ impl DashboardApp {
                         let judge_model = judge_provider.default_model().to_owned();
                         self.bias_judge_provider = Some(judge_provider);
 
+                        let judge_primary = self
+                            .last_analysis_primary
+                            .unwrap_or_else(|| {
+                                self.settings
+                                    .overlay_instruments
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(Instrument::Gold)
+                            });
+                        let judge_secondary = self.last_analysis_secondary.clone();
                         let (judge_sys, judge_usr) = eval::assemble_bias_judge_prompt(
-                            &self.settings.overlay_instruments,
+                            judge_primary,
+                            &judge_secondary,
                             &snapshots,
                             &result.response,
                         );
@@ -1809,7 +2195,7 @@ impl DashboardApp {
                 self.folds_task.reset();
                 self.ai_response = Some(result.response);
                 self.ai_response_provider = Some(result.provider.clone());
-                self.reload_inference_history();
+                self.reload_folds_status_map();
             }
             LlmPoll::Failed | LlmPoll::Pending | LlmPoll::Idle => {}
         }
@@ -1817,11 +2203,16 @@ impl DashboardApp {
 
     /// Poll the background LLM bias-judge task. When it completes,
     /// parse the structured output into `ResponseValidation` results.
+    /// Also refresh `last_bias_failures` so the next Re-analyze can feed
+    /// the failure reasons back into the system prompt as corrective
+    /// guidance.
     fn poll_bias_judge(&mut self) {
+        let mut settled = false;
         match self.bias_judge_task.poll() {
             LlmPoll::Response(result) => {
                 self.bias_judge_results =
                     Some(eval::parse_bias_judge(&result.response));
+                settled = true;
             }
             LlmPoll::Failed => {
                 // Judge failure is non-critical — deterministic checks
@@ -1837,8 +2228,30 @@ impl DashboardApp {
                     pass: false,
                     reason: err_msg,
                 }]);
+                settled = true;
             }
             LlmPoll::Pending | LlmPoll::Idle => {}
+        }
+
+        if settled {
+            // Merge deterministic + judge failures into one stash. The
+            // JUDGE_ERROR sentinel is excluded because it's about the
+            // judge itself, not the analysis content.
+            let mut failures: Vec<eval::ResponseValidation> = self
+                .bias_deterministic
+                .iter()
+                .filter(|v| !v.pass)
+                .cloned()
+                .collect();
+            if let Some(ref judge) = self.bias_judge_results {
+                failures.extend(
+                    judge
+                        .iter()
+                        .filter(|v| !v.pass && v.rule != "JUDGE_ERROR")
+                        .cloned(),
+                );
+            }
+            self.last_bias_failures = failures;
         }
     }
 
@@ -1858,7 +2271,7 @@ impl DashboardApp {
         match self.storage.load_inference_by_id(id) {
             Ok(Some(inf)) => {
                 self.load_historical_inference(inf);
-                self.reload_inference_history();
+                self.reload_folds_status_map();
                 self.set_status(
                     &format!("Research hypothesis loaded (inference #{id})"),
                     StatusKind::Success,
@@ -1891,52 +2304,56 @@ impl DashboardApp {
         self.draft_hypothesis = hypothesis;
         self.last_inference_id = Some(inf.id);
 
-        // Preserve in-flight build state across the reset — loading a
-        // historical inference should not kill a running model build.
-        // The toolbar spinner and central-view progress depend on these
-        // fields staying alive; when the build completes, poll_folds
-        // will auto-switch to the new model regardless of what's
-        // currently displayed.
-        let stashed_in_flight = self.folds_task.in_flight;
-        let stashed_rx = self.folds_task.rx.take();
-        let stashed_reevaluating = self.folds_task.reevaluating;
+        // If a build is currently in flight (or a completed model is
+        // visible) in the foreground, move it to the backlog before
+        // loading the new inference. This replaces the old in-flight
+        // stashing behaviour that preserved `rx` across the reset — the
+        // precise mechanism that caused the silent-discard bug documented
+        // in ADR 0020.
+        if self.folds_task.in_flight || self.folds_task.model.is_some() {
+            let parked = std::mem::replace(&mut self.folds_task, FoldsTask::new());
+            self.folds_backlog.park(parked);
+        } else {
+            self.folds_task.reset();
+        }
 
-        // Clear previous folds_task, then try to load the linked model
-        // from the database so completed models appear immediately.
-        self.folds_task.reset();
         if let Ok(Some(json)) = self.storage.load_folds_response_for_inference(inf.id) {
             self.folds_task.load_from_json(&json);
             if self.folds_task.model_id.is_some() {
                 self.central_view = CentralView::Model;
                 self.model_view = ModelView::Outcome;
             }
-            // Stubbed/incomplete model + API key → auto-refresh from server.
-            if !self.folds_task.is_complete()
-                && self.folds_task.model_id.is_some()
-                && !self.api_keys.folds.trim().is_empty()
-            {
-                self.start_folds_refresh();
+            if !self.folds_task.is_complete() && self.folds_task.model_id.is_some() {
+                // Two paths here: either (a) the linked model is
+                // currently in-flight in this session's backlog — in
+                // which case swap it into the foreground so the user
+                // sees the build spinner instead of a stub error; or
+                // (b) it's an abandoned stub from a prior session —
+                // refresh from the server to recover.
+                let id = self.folds_task.model_id.clone().unwrap();
+                if self.folds_backlog.background.contains_key(&id) {
+                    self.swap_foreground_with_backlog(&id);
+                } else if !self.api_keys.folds.trim().is_empty() {
+                    self.start_folds_refresh();
+                }
             }
         } else if let Ok(Some(model_id)) =
             self.storage.load_folds_model_id_for_inference(inf.id)
         {
-            // Model exists but has no response_json (e.g. timed out
-            // locally). Set the model_id and auto-refresh from the
-            // server — the model may have completed after the app
-            // stopped polling.
-            self.folds_task.model_id = Some(model_id);
             self.central_view = CentralView::Model;
             self.model_view = ModelView::Outcome;
-            if !self.api_keys.folds.trim().is_empty() {
-                self.start_folds_refresh();
+            // If this model is an in-flight build we already have in
+            // the backlog, surface it from there rather than trying to
+            // GET a stub from the server (which would fail with
+            // "incomplete model" until the build completes).
+            if self.folds_backlog.background.contains_key(&model_id) {
+                self.swap_foreground_with_backlog(&model_id);
+            } else {
+                self.folds_task.model_id = Some(model_id);
+                if !self.api_keys.folds.trim().is_empty() {
+                    self.start_folds_refresh();
+                }
             }
-        }
-        // Restore in-flight build state so the toolbar spinner stays
-        // alive and poll_main can still receive the completion event.
-        if stashed_in_flight {
-            self.folds_task.in_flight = true;
-            self.folds_task.rx = stashed_rx;
-            self.folds_task.reevaluating = stashed_reevaluating;
         }
 
         self.outcomes_task = LlmTask::new();
@@ -1961,9 +2378,23 @@ impl DashboardApp {
         let db_path = database_path();
         let inference_id = self.last_inference_id;
         let created_at = chrono::Utc::now();
+        let question_label = draft.question.clone();
+
+        // If there's already a build in the foreground that hasn't been
+        // consumed (in-flight, or completed but still visible), move it
+        // to the backlog before starting the new one. This is what
+        // replaces the in-flight render gate that used to hide the
+        // Create button. ADR 0020.
+        if self.folds_task.in_flight || self.folds_task.model.is_some() {
+            let parked = std::mem::replace(&mut self.folds_task, FoldsTask::new());
+            self.folds_backlog.park(parked);
+        }
 
         let (tx, rx) = mpsc::channel();
         self.folds_task.start(rx);
+        self.folds_task.question = Some(question_label);
+        self.folds_task.started_at = Some(created_at);
+        self.folds_task.inference_id = inference_id;
 
         thread::spawn(move || {
             crate::folds::create_and_poll(
@@ -2176,8 +2607,20 @@ impl DashboardApp {
 
     fn poll_folds(&mut self) {
         let was_complete = self.folds_task.is_complete();
+        let was_in_flight = self.folds_task.in_flight;
         let was_reevaluating = self.folds_task.reevaluating;
         self.folds_task.poll();
+
+        // Drain every backlog build's channel. Any terminal event
+        // (Completed/Failed) updates the row status in SQLite via the
+        // background thread — we pull the fresh status back into the
+        // in-memory badge map so the sidebar/Report reflect it live.
+        let backlog_touched = self.folds_backlog.poll_all();
+        let foreground_terminal =
+            was_in_flight && !self.folds_task.in_flight && !was_reevaluating;
+        if !backlog_touched.is_empty() || foreground_terminal {
+            self.reload_folds_status_map();
+        }
 
         // Auto-switch to the model view when the initial build just
         // completed.
@@ -2238,8 +2681,10 @@ impl DashboardApp {
         let mut marked_failure = 0usize;
         let db_path = database_path();
 
-        // Find the most recent pending model that isn't expired —
-        // this one gets routed through FoldsTask for UI visibility.
+        // Find the most recent pending model that isn't expired — this
+        // one gets routed through the foreground FoldsTask. Every other
+        // non-expired pending row goes into the backlog with its own
+        // channel. ADR 0020 replaces the previous fire-and-forget path.
         let ui_candidate_idx = pending
             .iter()
             .enumerate()
@@ -2274,34 +2719,40 @@ impl DashboardApp {
             let db_path_c = db_path.clone();
             let model_id_c = record.model_id.clone();
             let created_at_c = record.created_at;
+            let (tx, rx) = mpsc::channel();
 
             if Some(i) == ui_candidate_idx {
-                // Route through FoldsTask so the UI shows progress.
-                let (tx, rx) = mpsc::channel();
+                // Most-recent → foreground FoldsTask.
                 self.folds_task.reset();
                 self.folds_task.model_id = Some(model_id_c.clone());
                 self.folds_task.in_flight = true;
                 self.folds_task.rx = Some(rx);
-                thread::spawn(move || {
-                    crate::folds::resume_poll_ui(
-                        api_key_c,
-                        model_id_c,
-                        db_path_c,
-                        created_at_c,
-                        tx,
-                    );
-                });
+                self.folds_task.question = Some(record.question.clone());
+                self.folds_task.started_at = Some(record.created_at);
+                self.folds_task.inference_id = record.inference_id;
             } else {
-                // Background DB-only poll.
-                thread::spawn(move || {
-                    crate::folds::resume_poll(
-                        api_key_c,
-                        model_id_c,
-                        db_path_c,
-                        created_at_c,
-                    );
-                });
+                // Older → backlog.
+                let mut task = FoldsTask::new();
+                task.model_id = Some(model_id_c.clone());
+                task.in_flight = true;
+                task.rx = Some(rx);
+                task.question = Some(record.question.clone());
+                task.started_at = Some(record.created_at);
+                task.inference_id = record.inference_id;
+                self.folds_backlog
+                    .background
+                    .insert(model_id_c.clone(), task);
             }
+
+            thread::spawn(move || {
+                crate::folds::resume_poll_ui(
+                    api_key_c,
+                    model_id_c,
+                    db_path_c,
+                    created_at_c,
+                    tx,
+                );
+            });
             resumed += 1;
         }
 
@@ -2321,15 +2772,6 @@ impl DashboardApp {
             self.set_status(&msg, StatusKind::Info);
             eprintln!("{msg}");
         }
-    }
-
-    fn reload_inference_history(&mut self) {
-        self.inference_history = self
-            .storage
-            .load_recent_inferences(100)
-            .unwrap_or_default();
-        self.history_page = 0;
-        self.reload_folds_status_map();
     }
 
     fn reload_folds_status_map(&mut self) {
@@ -2366,6 +2808,10 @@ impl DashboardApp {
                     self.report_task.error = None;
                 }
                 self.report_inferences = inferences;
+                // A fresh list means any prior selection state is stale.
+                self.last_selected_report_id = None;
+                self.report_selection.clear();
+                self.report_result = None;
                 self.reload_folds_status_map();
             }
             Err(err) => {
@@ -2397,8 +2843,22 @@ impl DashboardApp {
             return;
         }
 
+        let scoped: Vec<SavedInference> = if self.report_selection.is_empty() {
+            self.report_inferences.clone()
+        } else {
+            self.report_inferences
+                .iter()
+                .filter(|inf| self.report_selection.contains(&inf.id))
+                .cloned()
+                .collect()
+        };
+        if scoped.is_empty() {
+            self.report_task.error =
+                Some("No inferences selected for report.".to_owned());
+            return;
+        }
         let (system_prompt, user_message) = ai::assemble_report_prompt(
-            &self.report_inferences,
+            &scoped,
             &self.report_from,
             &self.report_to,
         );
@@ -2441,7 +2901,7 @@ impl DashboardApp {
                     None,
                 );
                 self.report_result = Some(result.response);
-                self.reload_inference_history();
+                self.reload_folds_status_map();
             }
             LlmPoll::Failed | LlmPoll::Pending | LlmPoll::Idle => {}
         }
@@ -2691,6 +3151,154 @@ impl DashboardApp {
         }
     }
 
+    /// Toolbar tray chip — persistent indicator surfacing every in-flight
+    /// 51Folds build (foreground + backlog). Clicking opens a popover
+    /// listing each build; clicking an entry swaps that build into the
+    /// foreground and jumps to the Model view. Hidden when nothing is
+    /// building. ADR 0020.
+    fn render_folds_tray(&mut self, ui: &mut egui::Ui) {
+        let foreground_active =
+            self.folds_task.in_flight && !self.folds_task.reevaluating;
+        let backlog_active = self.folds_backlog.active_count();
+        let total_active =
+            (foreground_active as usize) + backlog_active;
+
+        if total_active == 0 {
+            return;
+        }
+
+        let chip_text = if total_active == 1 {
+            "◌ 1 building".to_owned()
+        } else {
+            format!("◌ {total_active} building")
+        };
+        let chip = ui
+            .small_button(RichText::new(chip_text).color(ACCENT_BLUE))
+            .on_hover_text("Click to see all in-flight 51Folds models.");
+        let popup_id = ui.make_persistent_id("folds_tray_popup");
+        if chip.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(popup_id));
+        }
+
+        // Collect display rows without borrowing self across the closure.
+        // Sort backlog entries by started_at so ordering is stable
+        // across frames (HashMap iteration is non-deterministic).
+        let mut rows: Vec<TrayRow> = Vec::new();
+        if self.folds_task.in_flight {
+            rows.push(TrayRow::from_task(
+                &self.folds_task,
+                /* is_foreground */ true,
+            ));
+        }
+        let mut backlog_rows: Vec<TrayRow> = self
+            .folds_backlog
+            .background
+            .values()
+            .filter(|t| t.in_flight)
+            .map(|t| TrayRow::from_task(t, false))
+            .chain(
+                self.folds_backlog
+                    .pending_creates
+                    .iter()
+                    .filter(|t| t.in_flight)
+                    .map(|t| TrayRow::from_task(t, false)),
+            )
+            .collect();
+        backlog_rows.sort_by_key(|r| r.started_at.unwrap_or_else(chrono::Utc::now));
+        rows.extend(backlog_rows);
+
+        let mut clicked_model_id: Option<String> = None;
+        let mut foreground_clicked = false;
+        egui::popup::popup_below_widget(
+            ui,
+            popup_id,
+            &chip,
+            egui::PopupCloseBehavior::CloseOnClickOutside,
+            |ui| {
+                ui.set_min_width(280.0);
+                ui.label(
+                    RichText::new("51Folds builds in progress")
+                        .size(11.0)
+                        .color(TEXT_MUTED),
+                );
+                ui.add_space(4.0);
+                for row in &rows {
+                    let elapsed_str = row.elapsed_label();
+                    let label = row.question.as_deref().unwrap_or("(untitled)");
+                    let model_id_short = row
+                        .model_id
+                        .as_deref()
+                        .map(|id| {
+                            if id.len() > 10 {
+                                format!("{}…", &id[..10])
+                            } else {
+                                id.to_owned()
+                            }
+                        })
+                        .unwrap_or_else(|| "(waiting for id)".to_owned());
+                    let response = ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(format!(
+                                    "{} — {}{}",
+                                    model_id_short,
+                                    truncate_with_ellipsis(label, 60),
+                                    if row.is_foreground {
+                                        "  ·  (foreground)"
+                                    } else {
+                                        ""
+                                    },
+                                ))
+                                .size(11.0)
+                                .color(TEXT_PRIMARY),
+                            )
+                            .fill(Color32::TRANSPARENT),
+                        )
+                        .on_hover_text(format!(
+                            "{}\n\nStarted {elapsed_str} ago",
+                            label,
+                        ));
+                    if response.clicked() {
+                        if row.is_foreground {
+                            foreground_clicked = true;
+                        } else if let Some(ref id) = row.model_id {
+                            clicked_model_id = Some(id.clone());
+                        }
+                    }
+                }
+            },
+        );
+
+        if let Some(id) = clicked_model_id {
+            self.swap_foreground_with_backlog(&id);
+            self.central_view = CentralView::Model;
+            self.model_view = ModelView::Outcome;
+            ui.memory_mut(|m| m.close_popup());
+        } else if foreground_clicked {
+            self.central_view = CentralView::Model;
+            self.model_view = ModelView::Outcome;
+            ui.memory_mut(|m| m.close_popup());
+        }
+    }
+
+    /// Swap the current foreground `folds_task` with a backlog entry by
+    /// model ID. The current foreground is parked; the chosen backlog
+    /// entry (if present) becomes the new foreground. No-op if the model
+    /// ID isn't in the backlog.
+    fn swap_foreground_with_backlog(&mut self, model_id: &str) {
+        let Some(mut replacement) = self.folds_backlog.take(model_id) else {
+            return;
+        };
+        let current = std::mem::replace(&mut self.folds_task, FoldsTask::new());
+        self.folds_backlog.park(current);
+        std::mem::swap(&mut self.folds_task, &mut replacement);
+        // Only init draft drivers if they haven't been set up before
+        // (preserves any in-progress re-eval edits made before parking).
+        if self.folds_task.is_complete() && self.folds_task.draft_drivers.is_empty() {
+            self.folds_task.init_draft_drivers();
+        }
+    }
+
     fn render_folds_section(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.separator();
@@ -2725,31 +3333,9 @@ impl DashboardApp {
             return;
         }
 
-        // ── Background build indicator ────────────────────────────
-        // When a model is building in the background but the user is
-        // viewing a different (loaded) model, show a small bar to
-        // let them switch back to the in-progress view.
-        if self.folds_task.in_flight
-            && !self.folds_task.reevaluating
-            && self.folds_task.is_complete()
-        {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(
-                    RichText::new("New model building...")
-                        .size(10.0)
-                        .color(ACCENT_BLUE),
-                );
-                if ui.small_button("Show").clicked() {
-                    // Clear the loaded model so the central view
-                    // reverts to the build-in-progress spinner.
-                    self.folds_task.model = None;
-                    self.central_view = CentralView::Model;
-                    self.model_view = ModelView::Outcome;
-                }
-            });
-            ui.add_space(4.0);
-        }
+        // (The old inline "New model building… [Show]" bar was removed
+        // in ADR 0020 — the toolbar tray is now the single affordance
+        // for tracking parallel builds.)
 
         // ── Post-creation: completed model → compact summary ──────
         if self.folds_task.is_complete() {
@@ -3512,16 +4098,18 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         let mut load_inferences = false;
         let mut load_history: Option<SavedInference> = None;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(20.0);
+        // Intentionally not wrapped in an outer ScrollArea — the inner
+        // ScrollArea around the inference list needs a bounded parent
+        // so that `ui.available_height()` returns meaningful space.
+        // Nested ScrollAreas break the sizing. Header + controls are
+        // short enough to fit on any reasonable window height.
+        ui.add_space(20.0);
 
-                // Centered column
-                ui.horizontal(|ui| {
-                    ui.add_space(side_pad);
-                    ui.vertical(|ui| {
-                        ui.set_max_width(max_width);
+        // Centered column
+        ui.horizontal(|ui| {
+            ui.add_space(side_pad);
+            ui.vertical(|ui| {
+                ui.set_max_width(max_width);
 
                         ui.label(
                             RichText::new("Summary Report")
@@ -3585,19 +4173,28 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                             }
                             if !self.report_inferences.is_empty() {
                                 ui.add_space(8.0);
+                                let total = self.report_inferences.len();
+                                let sel = self.report_selection.len();
+                                let summary = if sel == 0 {
+                                    format!("{total} inferences loaded")
+                                } else {
+                                    format!("{total} loaded · {sel} selected")
+                                };
                                 ui.label(
-                                    RichText::new(format!(
-                                        "{} inferences loaded",
-                                        self.report_inferences.len()
-                                    ))
-                                    .size(13.0)
-                                    .color(TEXT_SECONDARY),
+                                    RichText::new(summary)
+                                        .size(13.0)
+                                        .color(TEXT_SECONDARY),
                                 );
                                 if self.report_task.in_flight {
                                     ui.spinner();
                                 } else {
                                     ui.add_space(8.0);
-                                    if ui.button("Generate Report").clicked() {
+                                    let btn_label = if sel == 0 {
+                                        format!("Generate Report (all {total})")
+                                    } else {
+                                        format!("Generate Report ({sel} selected)")
+                                    };
+                                    if ui.button(btn_label).clicked() {
                                         start_report = true;
                                     }
                                 }
@@ -3639,104 +4236,229 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                             egui_commonmark::CommonMarkViewer::new()
                                 .show(ui, &mut self.report_markdown_cache, report);
                         } else if !self.report_inferences.is_empty() {
-                            // Browsable inference list
+                            // Header: title + Select all / Clear
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Loaded Inferences")
+                                        .strong()
+                                        .size(14.0)
+                                        .color(TEXT_SECONDARY),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("Clear")
+                                            .on_hover_text(
+                                                "Uncheck all rows — Generate Report will use all loaded inferences.",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.report_selection.clear();
+                                        }
+                                        ui.add_space(4.0);
+                                        if ui
+                                            .small_button("Select all")
+                                            .on_hover_text(
+                                                "Check every loaded inference for the next Generate Report.",
+                                            )
+                                            .clicked()
+                                        {
+                                            self.report_selection = self
+                                                .report_inferences
+                                                .iter()
+                                                .map(|i| i.id)
+                                                .collect();
+                                        }
+                                    },
+                                );
+                            });
                             ui.label(
-                                RichText::new("Loaded Inferences")
-                                    .strong()
-                                    .size(14.0)
-                                    .color(TEXT_SECONDARY),
+                                RichText::new("Tick rows to scope the report. Click a row to open its analysis.")
+                                    .size(11.0)
+                                    .color(TEXT_MUTED),
                             );
                             ui.add_space(6.0);
                             // Truncation target: fit within the max column width
                             // minus the dot + badge. Use word-boundary truncation.
-                            let label_max_chars = 90;
+                            let label_max_chars = 84;
 
-                            for inf in &self.report_inferences {
-                                let level_color = match inf.vix_level.as_deref() {
-                                    Some("extreme") => ALERT_EXTREME_FG,
-                                    Some("approaching_extreme") => ALERT_APPROACHING_FG,
-                                    _ => ALERT_NORMAL_FG,
-                                };
-                                let full_label = inference_label(inf);
-                                let folds_badge = self.folds_status_by_inference.get(&inf.id);
+                            // Virtualized list: ScrollArea::show_rows only
+                            // builds UI for rows currently visible. Fixed
+                            // row height (26px) keeps layout stable and
+                            // lets show_rows calculate the visible window.
+                            // Snapshot the inference list and folds-badge
+                            // map so we can mutate other self fields
+                            // (report_selection, last_selected_report_id)
+                            // inside the closure without borrow conflicts.
+                            let inferences_snapshot: Vec<SavedInference> =
+                                self.report_inferences.clone();
+                            let folds_badges_snapshot: std::collections::HashMap<i64, (String, String)> =
+                                self.folds_status_by_inference.clone();
+                            let total_rows = inferences_snapshot.len();
+                            let row_height = 26.0;
+                            // With the outer ScrollArea removed, the
+                            // parent container's height is bounded by
+                            // the central panel, so `available_height`
+                            // correctly tells us how much vertical
+                            // space is left for the list. Floor at
+                            // 200px to keep the list usable on very
+                            // short windows.
+                            let list_height =
+                                ui.available_height().max(200.0);
+                            egui::ScrollArea::vertical()
+                                .id_salt("report_inference_list")
+                                .auto_shrink([false, false])
+                                .max_height(list_height)
+                                .min_scrolled_height(list_height)
+                                .show_rows(ui, row_height, total_rows, |ui, range| {
+                                    for idx in range {
+                                        let inf = &inferences_snapshot[idx];
+                                        let level_color = match inf.vix_level.as_deref() {
+                                            Some("extreme") => ALERT_EXTREME_FG,
+                                            Some("approaching_extreme") => ALERT_APPROACHING_FG,
+                                            _ => ALERT_NORMAL_FG,
+                                        };
+                                        let full_label = inference_label(inf);
+                                        let folds_badge = folds_badges_snapshot.get(&inf.id);
 
-                                // Word-boundary truncation with ellipsis
-                                let display_label = if full_label.chars().count() > label_max_chars {
-                                    let truncated: String = full_label.chars().take(label_max_chars).collect();
-                                    // Find last space for word boundary
-                                    if let Some(last_space) = truncated.rfind(' ') {
-                                        format!("{}...", &truncated[..last_space])
-                                    } else {
-                                        format!("{truncated}...")
-                                    }
-                                } else {
-                                    full_label.clone()
-                                };
+                                        let display_label = if full_label.chars().count() > label_max_chars {
+                                            let truncated: String =
+                                                full_label.chars().take(label_max_chars).collect();
+                                            if let Some(last_space) = truncated.rfind(' ') {
+                                                format!("{}...", &truncated[..last_space])
+                                            } else {
+                                                format!("{truncated}...")
+                                            }
+                                        } else {
+                                            full_label.clone()
+                                        };
 
-                                // Full row as a clickable area with hover highlight
-                                let row_resp = ui.horizontal(|ui| {
-                                    let (dot_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(12.0, 12.0),
-                                        Sense::hover(),
-                                    );
-                                    ui.painter().circle_filled(
-                                        dot_rect.center(),
-                                        6.0,
-                                        level_color,
-                                    );
-                                    ui.add_space(6.0);
-                                    // Fixed-width 51Folds model column
-                                    let (badge_text, badge_color, badge_tip) = match folds_badge {
-                                        Some((mid, status)) => {
-                                            let tip = format!("51Folds model {mid} — {status}");
-                                            match status.as_str() {
-                                                "success" => (mid.clone(), ALERT_NORMAL_FG, tip),
-                                                "pending" => (format!("{mid}.."), ACCENT_BLUE, tip),
-                                                _ => (format!("{mid}!"), ALERT_EXTREME_FG, tip),
+                                        let is_last =
+                                            Some(inf.id) == self.last_selected_report_id;
+
+                                        let bg_idx = ui.painter().add(egui::Shape::Noop);
+                                        let stripe_idx = ui.painter().add(egui::Shape::Noop);
+
+                                        let mut checkbox_rect = egui::Rect::NOTHING;
+                                        let row_resp = ui.horizontal(|ui| {
+                                            let mut checked =
+                                                self.report_selection.contains(&inf.id);
+                                            let cb_resp =
+                                                ui.add(egui::Checkbox::without_text(&mut checked));
+                                            if cb_resp.changed() {
+                                                if checked {
+                                                    self.report_selection.insert(inf.id);
+                                                } else {
+                                                    self.report_selection.remove(&inf.id);
+                                                }
+                                            }
+                                            checkbox_rect = cb_resp.rect.expand(3.0);
+                                            cb_resp.on_hover_text(
+                                                "Include this inference when Generate Report is clicked.",
+                                            );
+                                            ui.add_space(4.0);
+
+                                            let (dot_rect, _) = ui.allocate_exact_size(
+                                                Vec2::new(12.0, 12.0),
+                                                Sense::hover(),
+                                            );
+                                            ui.painter().circle_filled(
+                                                dot_rect.center(),
+                                                6.0,
+                                                level_color,
+                                            );
+                                            ui.add_space(6.0);
+                                            let (badge_text, badge_color, badge_tip) = match folds_badge {
+                                                Some((mid, status)) => {
+                                                    let tip =
+                                                        format!("51Folds model {mid} — {status}");
+                                                    match status.as_str() {
+                                                        "success" => {
+                                                            (mid.clone(), ALERT_NORMAL_FG, tip)
+                                                        }
+                                                        "pending" => {
+                                                            (format!("{mid}.."), ACCENT_BLUE, tip)
+                                                        }
+                                                        _ => (
+                                                            format!("{mid}!"),
+                                                            ALERT_EXTREME_FG,
+                                                            tip,
+                                                        ),
+                                                    }
+                                                }
+                                                None => (
+                                                    "\u{2014}".to_owned(),
+                                                    TEXT_MUTED,
+                                                    "No 51Folds model".to_owned(),
+                                                ),
+                                            };
+                                            let badge_resp = ui.allocate_ui_with_layout(
+                                                Vec2::new(40.0, 18.0),
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(&badge_text)
+                                                            .size(13.0)
+                                                            .color(badge_color),
+                                                    );
+                                                },
+                                            );
+                                            badge_resp.response.on_hover_text(&badge_tip);
+                                            ui.label(
+                                                RichText::new(&display_label)
+                                                    .size(13.0)
+                                                    .color(TEXT_PRIMARY),
+                                            );
+                                        });
+                                        let row_rect = row_resp.response.rect;
+                                        let row_sense = ui.allocate_rect(row_rect, Sense::click());
+
+                                        if is_last {
+                                            ui.painter().set(
+                                                bg_idx,
+                                                egui::Shape::rect_filled(
+                                                    row_rect,
+                                                    4.0,
+                                                    Color32::from_rgba_unmultiplied(59, 130, 246, 28),
+                                                ),
+                                            );
+                                            let stripe = egui::Rect::from_min_size(
+                                                row_rect.left_top(),
+                                                Vec2::new(3.0, row_rect.height()),
+                                            );
+                                            ui.painter().set(
+                                                stripe_idx,
+                                                egui::Shape::rect_filled(stripe, 1.5, ACCENT_BLUE),
+                                            );
+                                        }
+
+                                        if row_sense.hovered() {
+                                            ui.painter().rect_filled(
+                                                row_rect,
+                                                4.0,
+                                                Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+                                            );
+                                            ui.ctx()
+                                                .set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        if row_sense.clicked() {
+                                            let on_checkbox = row_sense
+                                                .interact_pointer_pos()
+                                                .map(|p| checkbox_rect.contains(p))
+                                                .unwrap_or(false);
+                                            if !on_checkbox {
+                                                load_history = Some(inf.clone());
                                             }
                                         }
-                                        None => ("\u{2014}".to_owned(), TEXT_MUTED, "No 51Folds model".to_owned()),
-                                    };
-                                    let badge_resp = ui.allocate_ui_with_layout(
-                                        Vec2::new(40.0, 18.0),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                RichText::new(&badge_text)
-                                                    .size(13.0)
-                                                    .color(badge_color),
-                                            );
-                                        },
-                                    );
-                                    badge_resp.response.on_hover_text(&badge_tip);
-                                    ui.label(
-                                        RichText::new(&display_label)
-                                            .size(13.0)
-                                            .color(TEXT_PRIMARY),
-                                    );
+                                        if display_label != full_label {
+                                            row_sense.on_hover_text(&full_label);
+                                        }
+                                    }
                                 });
-                                // Make the entire row clickable with hover feedback
-                                let row_rect = row_resp.response.rect;
-                                let row_sense = ui.allocate_rect(row_rect, Sense::click());
-                                if row_sense.hovered() {
-                                    ui.painter().rect_filled(
-                                        row_rect,
-                                        4.0,
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, 8),
-                                    );
-                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                }
-                                if row_sense.clicked() {
-                                    load_history = Some(inf.clone());
-                                }
-                                if display_label != full_label {
-                                    row_sense.on_hover_text(&full_label);
-                                }
-                            }
                         }
                     });
                 });
-            });
 
         if load_inferences {
             self.load_report_inferences();
@@ -3745,11 +4467,54 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
             self.start_report_generation();
         }
         if let Some(inf) = load_history {
+            // Remember which row the user opened so we can highlight it
+            // on return. view_back_target is only set if the click
+            // actually navigates away (i.e. the inference has a loaded
+            // model that switches the central view).
+            self.last_selected_report_id = Some(inf.id);
+            let prior_view = self.central_view;
             self.load_historical_inference(inf);
+            if self.central_view != prior_view {
+                self.view_back_target = Some(prior_view);
+            }
         }
     }
 
+    /// Render a "← Back to …" pill when the user arrived at this view
+    /// via an in-app navigation (e.g. clicked an inference in the
+    /// Report list). No-op when there is no back target.
+    fn render_back_pill(&mut self, ui: &mut egui::Ui) {
+        let Some(target) = self.view_back_target else { return };
+        let label_text = match target {
+            CentralView::Report => "\u{2190} Back to Report",
+            CentralView::Charts => "\u{2190} Back to Charts",
+            CentralView::ResearchAgent => "\u{2190} Back to Research",
+            CentralView::Model => "\u{2190} Back",
+        };
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            let resp = ui.add(
+                egui::Button::new(
+                    RichText::new(label_text)
+                        .size(12.0)
+                        .color(ACCENT_BLUE),
+                )
+                .fill(Color32::TRANSPARENT)
+                .corner_radius(4.0),
+            );
+            if resp.clicked() {
+                self.central_view = target;
+                self.view_back_target = None;
+                // last_selected_report_id stays set so the Report view
+                // highlights the row the user just returned from.
+            }
+        });
+        ui.add_space(4.0);
+    }
+
     fn render_central_model_view(&mut self, ui: &mut egui::Ui) {
+        self.render_back_pill(ui);
         if !self.folds_task.is_complete() {
             // ── Build in progress — show spinner + model ID ───────
             if self.folds_task.in_flight {
@@ -5447,6 +6212,26 @@ impl eframe::App for DashboardApp {
 
         self.show_dashboard(ctx);
 
+        // -- Primary-instrument picker modal --
+        // Shown when the user clicks Analyze with more than one overlay
+        // instrument selected. Confirm re-enters `start_ai_analysis`
+        // with `analyze_primary_choice` set so the guard lets it
+        // through. Cancel clears both fields.
+        if self.analyze_primary_pending {
+            let selected = self.settings.overlay_instruments.clone();
+            let mut choice = self.analyze_primary_choice;
+            let (cancel, confirm) =
+                render_analyze_primary_dialog(ctx, &selected, &mut choice);
+            self.analyze_primary_choice = choice;
+            if cancel {
+                self.analyze_primary_pending = false;
+                self.analyze_primary_choice = None;
+            } else if confirm {
+                self.analyze_primary_pending = false;
+                self.start_ai_analysis();
+            }
+        }
+
         // -- Revert-to-original confirmation dialog --
         // Shown when the user clicks "Revert to original" on the
         // Drivers tab. Diffs the current in-memory model against the
@@ -5544,22 +6329,39 @@ impl DashboardApp {
         // -- Dashboard sub-toolbar --
         egui::TopBottomPanel::top("rs_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                // Central view tabs
-                ui.selectable_value(&mut self.central_view, CentralView::Charts, "Charts");
+                // Central view tabs — explicit navigation clears any
+                // pending back-pill target.
+                if ui
+                    .selectable_value(&mut self.central_view, CentralView::Charts, "VIX charts")
+                    .clicked()
+                {
+                    self.view_back_target = None;
+                }
                 let model_label = if self.folds_task.is_complete() {
                     RichText::new("51Folds").color(Color32::from_rgb(59, 130, 246))
                 } else {
                     RichText::new("51Folds")
                 };
-                ui.selectable_value(&mut self.central_view, CentralView::Model, model_label);
+                if ui
+                    .selectable_value(&mut self.central_view, CentralView::Model, model_label)
+                    .clicked()
+                {
+                    self.view_back_target = None;
+                }
                 if self.folds_task.in_flight && !self.folds_task.reevaluating {
                     ui.spinner();
                 }
-                ui.selectable_value(
-                    &mut self.central_view,
-                    CentralView::ResearchAgent,
-                    "Research Agent",
-                );
+                self.render_folds_tray(ui);
+                if ui
+                    .selectable_value(
+                        &mut self.central_view,
+                        CentralView::ResearchAgent,
+                        "Research Agent",
+                    )
+                    .clicked()
+                {
+                    self.view_back_target = None;
+                }
                 ui.separator();
 
                 // Chart-specific controls (only when Charts tab is active)
@@ -5600,6 +6402,7 @@ impl DashboardApp {
                 // Report — always available (covers both AI and Research analyses)
                 ui.separator();
                 if ui.button("Report").clicked() {
+                    self.view_back_target = None;
                     if self.central_view == CentralView::Report {
                         self.central_view = CentralView::Charts;
                     } else {
@@ -5850,145 +6653,9 @@ impl DashboardApp {
                             } else if ui.button("Analyze Current View").clicked() {
                                 self.start_ai_analysis();
                             }
-
-                            // Inference history
-                            if !self.inference_history.is_empty() {
-                                ui.add_space(6.0);
-                                ui.label(
-                                    RichText::new("History")
-                                        .size(11.0)
-                                        .color(TEXT_MUTED),
-                                );
-                                // Each row: short label visible, full
-                                // label (with hypothesis question) shown
-                                // on hover. Truncation is done MANUALLY
-                                // — not via Label::truncate() — because
-                                // egui's truncate() attaches its own
-                                // auto-tooltip when the label is elided,
-                                // and that combined with our explicit
-                                // on_hover_text produced two tooltips.
-                                let mut load_inference: Option<SavedInference> = None;
-                                let page_size = 10;
-                                let total = self.inference_history.len();
-                                let total_pages = (total + page_size - 1) / page_size;
-                                let start = self.history_page * page_size;
-                                let end = (start + page_size).min(total);
-                                let page_items = &self.inference_history[start..end];
-
-                                for inf in page_items {
-                                    let level_color = match inf.vix_level.as_deref() {
-                                        Some("extreme") => ALERT_EXTREME_FG,
-                                        Some("approaching_extreme") => ALERT_APPROACHING_FG,
-                                        _ => ALERT_NORMAL_FG,
-                                    };
-                                    let short = inference_label_short(inf);
-                                    let full = inference_label_full(inf);
-                                    let folds_badge = self.folds_status_by_inference.get(&inf.id);
-                                    let display = truncate_with_ellipsis(&short, 50);
-                                    let hover = if let Some((mid, status)) = folds_badge {
-                                        format!("51Folds model {mid} — {status}\n\n{full}")
-                                    } else {
-                                        full
-                                    };
-                                    ui.horizontal(|ui| {
-                                        let (dot_rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(8.0, 8.0),
-                                            Sense::hover(),
-                                        );
-                                        ui.painter().circle_filled(
-                                            dot_rect.center(),
-                                            4.0,
-                                            level_color,
-                                        );
-                                        // Fixed-width model badge column
-                                        let (badge_char, badge_color) = match folds_badge {
-                                            Some((_, status)) => match status.as_str() {
-                                                "success" => ("\u{25A0}", ALERT_NORMAL_FG),   // ■
-                                                "pending" => ("\u{25A0}", ACCENT_BLUE),
-                                                _ => ("\u{25A0}", ALERT_EXTREME_FG),
-                                            },
-                                            None => ("\u{25A1}", TEXT_MUTED),                  // □
-                                        };
-                                        ui.allocate_ui_with_layout(
-                                            Vec2::new(12.0, 10.0),
-                                            egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                                            |ui| {
-                                                ui.label(
-                                                    RichText::new(badge_char)
-                                                        .size(8.0)
-                                                        .color(badge_color),
-                                                );
-                                            },
-                                        );
-                                        let resp = ui
-                                            .add(
-                                                egui::Label::new(
-                                                    RichText::new(&display)
-                                                        .size(10.0)
-                                                        .color(TEXT_SECONDARY),
-                                                )
-                                                .sense(Sense::click()),
-                                            )
-                                            .on_hover_text(&hover);
-                                        if resp.clicked() {
-                                            load_inference = Some(inf.clone());
-                                        }
-                                    });
-                                }
-                                if let Some(inf) = load_inference {
-                                    self.load_historical_inference(inf);
-                                }
-                                // Paging controls
-                                if total_pages > 1 {
-                                    ui.add_space(4.0);
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                self.history_page > 0,
-                                                egui::Button::new(
-                                                    RichText::new("\u{25C0}")
-                                                        .size(9.0)
-                                                        .color(TEXT_SECONDARY),
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.history_page -= 1;
-                                        }
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{}/{}",
-                                                self.history_page + 1,
-                                                total_pages,
-                                            ))
-                                            .size(9.0)
-                                            .color(TEXT_MUTED),
-                                        );
-                                        if ui
-                                            .add_enabled(
-                                                self.history_page + 1 < total_pages,
-                                                egui::Button::new(
-                                                    RichText::new("\u{25B6}")
-                                                        .size(9.0)
-                                                        .color(TEXT_SECONDARY),
-                                                ),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.history_page += 1;
-                                        }
-                                    });
-                                }
-                                ui.add_space(6.0);
-                                if ui.button("Clear History").clicked() {
-                                    if let Err(e) = self.storage.clear_inferences() {
-                                        self.set_status(&format!("Failed to clear history: {e}"), StatusKind::Error);
-                                    } else {
-                                        self.inference_history.clear();
-                                        self.set_status("Inference history cleared.", StatusKind::Success);
-                                    }
-                                }
-                            }
+                            // Historical inferences browser lives in the
+                            // Report view (date-range + selectable list).
+                            // The sidebar version was removed as redundant.
                         });
 
                     egui::CollapsingHeader::new("Research Agent")
@@ -6295,8 +6962,6 @@ fn sidebar_overlay_controls(ui: &mut egui::Ui, settings: &mut AppSettings) {
             settings.overlay_instruments = vec![
                 Instrument::Gold,
                 Instrument::Silver,
-                Instrument::Copper,
-                Instrument::Aluminum,
             ];
         }
         if ui.small_button("All").clicked() {
@@ -6362,34 +7027,17 @@ fn sidebar_spike_episodes(
             AlertLevel::Extreme => ALERT_EXTREME_FG,
         };
         let is_selected = *highlighted == Some((ep.start, ep.end));
-        ui.horizontal_wrapped(|ui| {
-            // Solid filled circle, clickable
-            let (circle_rect, circle_resp) =
-                ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::click());
-            let center = circle_rect.center();
-            let radius = 5.0;
-            ui.painter().circle_filled(center, radius, level_color);
-            if is_selected {
-                ui.painter().circle_stroke(
-                    center,
-                    radius + 1.5,
-                    Stroke::new(1.5, Color32::WHITE),
-                );
-            }
-            if circle_resp.clicked() {
-                if is_selected {
-                    *highlighted = None;
-                } else {
-                    *highlighted = Some((ep.start, ep.end));
-                }
-            }
-            if circle_resp.hovered() {
-                ui.painter().circle_stroke(
-                    center,
-                    radius + 1.0,
-                    Stroke::new(1.0, Color32::from_gray(140)),
-                );
-            }
+
+        // Reserve shape slots so the row highlight + left accent stripe
+        // render beneath the row content.
+        let bg_idx = ui.painter().add(egui::Shape::Noop);
+        let stripe_idx = ui.painter().add(egui::Shape::Noop);
+
+        let row_resp = ui.horizontal_wrapped(|ui| {
+            let (circle_rect, _) =
+                ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
+            ui.painter()
+                .circle_filled(circle_rect.center(), 5.0, level_color);
             ui.label(
                 RichText::new(format!(
                     "{} to {} | peak {:.1} | {}d",
@@ -6401,6 +7049,48 @@ fn sidebar_spike_episodes(
                 .size(11.0),
             );
         });
+
+        let row_rect = row_resp.response.rect;
+        let row_sense = ui.allocate_rect(row_rect, Sense::click());
+
+        if is_selected {
+            ui.painter().set(
+                bg_idx,
+                egui::Shape::rect_filled(
+                    row_rect,
+                    4.0,
+                    Color32::from_rgba_unmultiplied(59, 130, 246, 28),
+                ),
+            );
+            let stripe = egui::Rect::from_min_size(
+                row_rect.left_top(),
+                Vec2::new(3.0, row_rect.height()),
+            );
+            ui.painter()
+                .set(stripe_idx, egui::Shape::rect_filled(stripe, 1.5, ACCENT_BLUE));
+        }
+
+        if row_sense.hovered() {
+            if !is_selected {
+                ui.painter().rect_filled(
+                    row_rect,
+                    4.0,
+                    Color32::from_rgba_unmultiplied(255, 255, 255, 8),
+                );
+            }
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+
+        // Double-click anywhere on the row clears the selection.
+        // Single click selects (idempotent on an already-selected row).
+        // The first click of a double-click still fires clicked(), so
+        // the sequence resolves to: select → deselect, which matches
+        // user intent: "double click unselects it".
+        if row_sense.double_clicked() {
+            *highlighted = None;
+        } else if row_sense.clicked() {
+            *highlighted = Some((ep.start, ep.end));
+        }
     }
 }
 
@@ -6679,6 +7369,99 @@ fn render_apply_confirm_dialog(
                             egui::Button::new(
                                 RichText::new("Apply")
                                     .size(13.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(ACCENT_BLUE_DIM)
+                            .corner_radius(6.0),
+                        );
+                        if btn.clicked() {
+                            confirm = true;
+                        }
+                    },
+                );
+            });
+        });
+    (cancel, confirm)
+}
+
+/// Render the "pick the primary instrument" modal shown when the user
+/// clicks Analyze with more than one overlay instrument selected. The
+/// caller passes the current selection plus a mutable choice (the
+/// radio state). Returns `(cancelled, confirmed)`; on confirm the
+/// caller reads the updated `choice` and drives `start_ai_analysis`.
+fn render_analyze_primary_dialog(
+    ctx: &egui::Context,
+    selected: &[Instrument],
+    choice: &mut Option<Instrument>,
+) -> (bool, bool) {
+    let screen = ctx.screen_rect();
+    let win_w = 420.0_f32.min(screen.width() * 0.85);
+    let win_h = (160.0 + 30.0 * selected.len() as f32).min(screen.height() * 0.85);
+    let mut cancel = false;
+    let mut confirm = false;
+    egui::Window::new("pick_primary_instrument")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size([win_w, win_h])
+        .default_pos([
+            (screen.width() - win_w) / 2.0,
+            (screen.height() - win_h) / 2.0,
+        ])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("Pick the primary instrument for this analysis")
+                    .size(15.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "The primary is the subject of the hypothesis. The other \
+                     selected instruments will be mentioned as corroborative \
+                     signal, not as subject.",
+                )
+                .size(11.0)
+                .color(TEXT_SECONDARY),
+            );
+            ui.add_space(12.0);
+            for inst in selected {
+                let selected_now = *choice == Some(*inst);
+                if ui
+                    .radio(selected_now, inst.as_str())
+                    .clicked()
+                {
+                    *choice = Some(*inst);
+                }
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().button_padding = Vec2::new(14.0, 6.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Cancel")
+                                .size(12.0)
+                                .color(TEXT_PRIMARY),
+                        )
+                        .fill(SURFACE)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .corner_radius(6.0),
+                    )
+                    .clicked()
+                {
+                    cancel = true;
+                }
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let btn = ui.add_enabled(
+                            choice.is_some(),
+                            egui::Button::new(
+                                RichText::new("Analyze")
+                                    .size(12.0)
                                     .strong()
                                     .color(Color32::WHITE),
                             )
@@ -7726,11 +8509,6 @@ fn instrument_color(instrument: Instrument) -> Color32 {
         Instrument::Bitcoin => Color32::from_rgb(240, 149, 66),
         Instrument::CrudeOil => Color32::from_rgb(186, 109, 71),
         Instrument::NaturalGas => Color32::from_rgb(91, 168, 189),
-        Instrument::Copper => Color32::from_rgb(201, 119, 84),
-        Instrument::Aluminum => Color32::from_rgb(181, 190, 204),
-        Instrument::Wheat => Color32::from_rgb(214, 174, 78),
-        Instrument::Corn => Color32::from_rgb(235, 214, 77),
-        Instrument::Soybeans => Color32::from_rgb(153, 187, 86),
     }
 }
 
@@ -7791,10 +8569,7 @@ fn update_env_content(content: &str, updates: &[(&str, &str)]) -> String {
 
 /// Build a one-line label for an inference list entry. Format:
 /// `MM-DD HH:MM  [Kind] VIX 23.9  Gold/Silver  · {hypothesis snippet}`
-///
-/// Used in places with horizontal room (the report window). For the
-/// narrow sidebar history list, see `inference_label_short`, which omits
-/// the hypothesis snippet so the row fits in a 240px-wide panel.
+/// Used in the Report view's inference list.
 fn inference_label(inf: &SavedInference) -> String {
     let header = inference_label_short(inf);
     let snippet = inference_hypothesis_snippet(inf, 60);
@@ -7802,28 +8577,6 @@ fn inference_label(inf: &SavedInference) -> String {
         header
     } else {
         format!("{header}  · {snippet}")
-    }
-}
-
-/// Build the full label used in tooltips. Same shape as `inference_label`
-/// but the hypothesis text is not snippetted — the user wants to read the
-/// whole question on hover, not just the first 60 characters.
-fn inference_label_full(inf: &SavedInference) -> String {
-    let header = inference_label_short(inf);
-    let hypothesis: String = if let Some(ref q) = inf.hypothesis_question {
-        q.trim().to_owned()
-    } else {
-        inf.response
-            .lines()
-            .find(|l| !l.trim().is_empty() && !l.starts_with('#') && !l.starts_with("**Regime"))
-            .unwrap_or("")
-            .trim()
-            .to_owned()
-    };
-    if hypothesis.is_empty() {
-        header
-    } else {
-        format!("{header}\n\n{hypothesis}")
     }
 }
 
@@ -7838,10 +8591,8 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     format!("{head}…")
 }
 
-/// Compact label for the sidebar history list. Stops at the overlay
-/// instruments — no hypothesis snippet, so the line is short enough to
-/// fit comfortably in a 240px sidebar without forcing a horizontal stretch.
-/// The full label (with snippet) is shown as a hover tooltip.
+/// Compact header for an inference label — timestamp + kind + VIX +
+/// overlay. Used as the prefix by `inference_label` in the Report view.
 fn inference_label_short(inf: &SavedInference) -> String {
     let ts: String = if inf.created_at.len() >= 16 {
         inf.created_at[5..16].replace('T', " ")
@@ -8195,7 +8946,7 @@ fn sanitize_overlay_selection(settings: &mut AppSettings) {
         .overlay_instruments
         .retain(|instrument| *instrument != Instrument::Vix);
 
-    let mut seen = [false; 11];
+    let mut seen = [false; 6];
     settings.overlay_instruments.retain(|instrument| {
         let idx = match instrument {
             Instrument::Vix => 0,
@@ -8204,11 +8955,6 @@ fn sanitize_overlay_selection(settings: &mut AppSettings) {
             Instrument::Bitcoin => 3,
             Instrument::CrudeOil => 4,
             Instrument::NaturalGas => 5,
-            Instrument::Copper => 6,
-            Instrument::Aluminum => 7,
-            Instrument::Wheat => 8,
-            Instrument::Corn => 9,
-            Instrument::Soybeans => 10,
         };
         if seen[idx] {
             return false;

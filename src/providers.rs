@@ -158,14 +158,6 @@ fn build_specs_fred() -> Vec<ProviderSpec> {
 fn build_specs_alpha_vantage() -> Vec<ProviderSpec> {
     vec![
         ProviderSpec {
-            instrument: Instrument::Soybeans,
-            source: "Alpha Vantage SOYBEANS",
-            kind: ProviderKind::AlphaCommodity {
-                function: "SOYBEANS",
-                interval: "daily",
-            },
-        },
-        ProviderSpec {
             instrument: Instrument::Gold,
             source: "Alpha Vantage GOLD",
             kind: ProviderKind::AlphaMetal { symbol: "GOLD" },
@@ -196,38 +188,6 @@ fn build_specs_alpha_vantage() -> Vec<ProviderSpec> {
             source: "Alpha Vantage NATURAL_GAS",
             kind: ProviderKind::AlphaCommodity {
                 function: "NATURAL_GAS",
-                interval: "daily",
-            },
-        },
-        ProviderSpec {
-            instrument: Instrument::Copper,
-            source: "Alpha Vantage COPPER",
-            kind: ProviderKind::AlphaCommodity {
-                function: "COPPER",
-                interval: "daily",
-            },
-        },
-        ProviderSpec {
-            instrument: Instrument::Aluminum,
-            source: "Alpha Vantage ALUMINUM",
-            kind: ProviderKind::AlphaCommodity {
-                function: "ALUMINUM",
-                interval: "daily",
-            },
-        },
-        ProviderSpec {
-            instrument: Instrument::Wheat,
-            source: "Alpha Vantage WHEAT",
-            kind: ProviderKind::AlphaCommodity {
-                function: "WHEAT",
-                interval: "daily",
-            },
-        },
-        ProviderSpec {
-            instrument: Instrument::Corn,
-            source: "Alpha Vantage CORN",
-            kind: ProviderKind::AlphaCommodity {
-                function: "CORN",
                 interval: "daily",
             },
         },
