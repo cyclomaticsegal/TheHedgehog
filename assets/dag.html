@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0e1a;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    width: 100vw;
+    height: 100vh;
+  }
+  svg {
+    width: 100%;
+    height: 100%;
+  }
+  /* Edges — thin straight lines like 51Folds */
+  line.edge { stroke: #4a5568; stroke-width: 1; opacity: 0.4; }
+  line.edge.highlighted { stroke: #60a5fa; stroke-width: 2; opacity: 1; }
+  line.edge.path-to-dv { stroke: #e53e3e; stroke-width: 2; opacity: 1; }
+  line.edge.dimmed { opacity: 0.06; }
+  /* Nodes — warm gold/tan circles like 51Folds */
+  .node circle {
+    fill: #d4a574;
+    stroke: #b8925a;
+    stroke-width: 1.5;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .node text {
+    fill: #2d2010;
+    font-size: 10px;
+    font-weight: 700;
+    text-anchor: middle;
+    dominant-baseline: central;
+    pointer-events: none;
+    letter-spacing: 0.3px;
+  }
+  .node.dimmed circle { opacity: 0.12; }
+  .node.dimmed text { opacity: 0.12; }
+  /* DV / Outcome node */
+  .node-dv circle { fill: #c53030; stroke: #e53e3e; stroke-width: 2; }
+  .node-dv text { fill: #fff; font-size: 9px; font-weight: 600; }
+  /* Tooltip */
+  .tooltip {
+    position: fixed;
+    padding: 10px 14px;
+    background: #1a2236;
+    border: 1px solid #2d3748;
+    border-radius: 8px;
+    color: #e2e8f0;
+    font-size: 12px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    max-width: 280px;
+    z-index: 100;
+    line-height: 1.5;
+  }
+  .tooltip .driver-name { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+  .tooltip .state-label { color: #94a3b8; }
+  .tooltip .state-value { font-weight: 600; }
+</style>
+</head>
+<body>
+<svg id="dag"></svg>
+<div class="tooltip" id="tooltip"></div>
+
+<script>%%D3_JS%%</script>
+<script>%%DAGRE_JS%%</script>
+
+<script>
+(function() {
+  'use strict';
+
+  let modelData = null;
+  let graphLayout = null;
+  const svg = d3.select('#dag');
+  const tooltip = d3.select('#tooltip');
+  let g; // main group (for zoom/pan)
+
+  function init() {
+    g = svg.append('g');
+
+    // Arrow marker definition
+    svg.append('defs').append('marker')
+      .attr('id', 'arrowhead')
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 28)
+      .attr('refY', 0)
+      .attr('markerWidth', 6)
+      .attr('markerHeight', 6)
+      .attr('orient', 'auto')
+      .append('path')
+      .attr('d', 'M0,-4L8,0L0,4')
+      .attr('fill', '#4a5568');
+
+    svg.append('defs').append('marker')
+      .attr('id', 'arrowhead-hl')
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 28)
+      .attr('refY', 0)
+      .attr('markerWidth', 6)
+      .attr('markerHeight', 6)
+      .attr('orient', 'auto')
+      .attr('class', 'highlighted')
+      .append('path')
+      .attr('d', 'M0,-4L8,0L0,4')
+      .attr('fill', '#60a5fa');
+
+    svg.append('defs').append('marker')
+      .attr('id', 'arrowhead-dv')
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 32)
+      .attr('refY', 0)
+      .attr('markerWidth', 6)
+      .attr('markerHeight', 6)
+      .attr('orient', 'auto')
+      .attr('class', 'path-to-dv')
+      .append('path')
+      .attr('d', 'M0,-4L8,0L0,4')
+      .attr('fill', '#e53e3e');
+
+    // Zoom/pan
+    const zoom = d3.zoom()
+      .scaleExtent([0.3, 3])
+      .on('zoom', (event) => {
+        g.attr('transform', event.transform);
+      });
+    svg.call(zoom);
+  }
+
+  function stateClass(state) {
+    if (!state) return 'state-unknown';
+    const s = state.toLowerCase().replace(/\s+/g, '');
+    if (['negligible', 'negligent'].includes(s)) return 'state-negligible';
+    if (s === 'low') return 'state-low';
+    if (s === 'medium') return 'state-medium';
+    if (s === 'high') return 'state-high';
+    if (s === 'extreme') return 'state-extreme';
+    return 'state-unknown';
+  }
+
+  // Find all edges connected to a node (as parent or child)
+  function connectedEdges(code) {
+    if (!modelData) return { edges: [], nodes: new Set() };
+    const edges = modelData.edges.filter(e => e.parent === code || e.child === code);
+    const nodes = new Set();
+    nodes.add(code);
+    edges.forEach(e => { nodes.add(e.parent); nodes.add(e.child); });
+    return { edges, nodes };
+  }
+
+  // Find path from a node to DV (BFS)
+  function pathToDV(code) {
+    if (!modelData) return [];
+    const children = {};
+    modelData.edges.forEach(e => {
+      if (!children[e.parent]) children[e.parent] = [];
+      children[e.parent].push(e.child);
+    });
+    // BFS
+    const queue = [[code]];
+    const visited = new Set([code]);
+    while (queue.length > 0) {
+      const path = queue.shift();
+      const current = path[path.length - 1];
+      if (current === 'DV') return path;
+      for (const child of (children[current] || [])) {
+        if (!visited.has(child)) {
+          visited.add(child);
+          queue.push([...path, child]);
+        }
+      }
+    }
+    return [];
+  }
+
+  function renderGraph() {
+    if (!modelData) return;
+
+    // Build dagre graph — tight spacing to match 51Folds
+    const dg = new dagre.graphlib.Graph();
+    dg.setGraph({
+      rankdir: 'TB',
+      nodesep: 40,
+      ranksep: 55,
+      marginx: 20,
+      marginy: 20,
+    });
+    dg.setDefaultEdgeLabel(() => ({}));
+
+    // Add driver nodes (compact)
+    modelData.drivers.forEach(d => {
+      dg.setNode(d.code, { width: 38, height: 38 });
+    });
+
+    // Add DV node (slightly larger)
+    dg.setNode('DV', { width: 46, height: 46 });
+
+    // Add edges
+    modelData.edges.forEach(e => {
+      dg.setEdge(e.parent, e.child);
+    });
+
+    // Run layout
+    dagre.layout(dg);
+    graphLayout = dg;
+
+    // Clear previous render
+    g.selectAll('*').remove();
+
+    // Draw edges — straight lines, no arrowheads (matching 51Folds)
+    const edgesG = g.append('g').attr('class', 'edges');
+    modelData.edges.forEach(e => {
+      const srcNode = dg.node(e.parent);
+      const tgtNode = dg.node(e.child);
+      if (!srcNode || !tgtNode) return;
+      edgesG.append('line')
+        .attr('class', 'edge')
+        .attr('x1', srcNode.x)
+        .attr('y1', srcNode.y)
+        .attr('x2', tgtNode.x)
+        .attr('y2', tgtNode.y)
+        .attr('data-parent', e.parent)
+        .attr('data-child', e.child);
+    });
+
+    // Draw nodes on top of edges
+    const nodesG = g.append('g').attr('class', 'nodes');
+
+    // Driver nodes — compact gold circles
+    modelData.drivers.forEach(d => {
+      const node = dg.node(d.code);
+      const nodeG = nodesG.append('g')
+        .attr('class', 'node')
+        .attr('data-code', d.code)
+        .attr('transform', `translate(${node.x}, ${node.y})`);
+
+      nodeG.append('circle')
+        .attr('r', 18);
+
+      nodeG.append('text')
+        .text(d.code);
+
+      nodeG.on('mouseenter', () => onNodeHover(d.code, d.name, d.state, node.x, node.y));
+      nodeG.on('mouseleave', () => onNodeLeave());
+      nodeG.on('click', () => onNodeClick(d.code));
+    });
+
+    // DV / Outcome node
+    const dvNode = dg.node('DV');
+    if (dvNode) {
+      const dvG = nodesG.append('g')
+        .attr('class', 'node node-dv')
+        .attr('data-code', 'DV')
+        .attr('transform', `translate(${dvNode.x}, ${dvNode.y})`);
+
+      dvG.append('circle')
+        .attr('r', 22);
+
+      dvG.append('text')
+        .text('Outcome');
+
+      dvG.on('mouseenter', () => {
+        const outcomesText = modelData.outcomes
+          .map(o => `${o[0]}: ${(o[1] * 100).toFixed(1)}%`)
+          .join('\n');
+        showTooltip(dvNode.x, dvNode.y, 'Decision Variable', outcomesText);
+      });
+      dvG.on('mouseleave', () => onNodeLeave());
+    }
+
+    // Fit to viewport
+    fitToView();
+  }
+
+  function fitToView() {
+    if (!graphLayout) return;
+    const graph = graphLayout.graph();
+    const svgEl = svg.node();
+    const vw = svgEl.clientWidth;
+    const vh = svgEl.clientHeight;
+    const gw = graph.width || 400;
+    const gh = graph.height || 400;
+    const scale = Math.min(vw / (gw + 80), vh / (gh + 80), 1.2);
+    const tx = (vw - gw * scale) / 2;
+    const ty = (vh - gh * scale) / 2;
+    svg.call(d3.zoom().transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+  }
+
+  function onNodeHover(code, name, state, nx, ny) {
+    const { edges: connEdges, nodes: connNodes } = connectedEdges(code);
+    const dvPath = pathToDV(code);
+    const dvPathEdges = new Set();
+    for (let i = 0; i < dvPath.length - 1; i++) {
+      dvPathEdges.add(`${dvPath[i]}->${dvPath[i+1]}`);
+    }
+
+    // Dim all nodes
+    g.selectAll('.node').classed('dimmed', d => true);
+    // Undim connected
+    connNodes.forEach(c => {
+      g.selectAll(`.node[data-code="${c}"]`).classed('dimmed', false);
+    });
+
+    // Dim all edges, then highlight connected
+    g.selectAll('.edge')
+      .classed('dimmed', true)
+      .classed('highlighted', false)
+      .classed('path-to-dv', false);
+
+    connEdges.forEach(e => {
+      const edgeKey = `${e.parent}->${e.child}`;
+      const sel = g.selectAll(`.edge[data-parent="${e.parent}"][data-child="${e.child}"]`);
+      sel.classed('dimmed', false);
+      if (dvPathEdges.has(edgeKey)) {
+        sel.classed('path-to-dv', true);
+      } else {
+        sel.classed('highlighted', true);
+      }
+    });
+
+    showTooltip(nx, ny, name, `State: ${state || 'unknown'}`);
+  }
+
+  function onNodeLeave() {
+    g.selectAll('.node').classed('dimmed', false);
+    g.selectAll('.edge')
+      .classed('dimmed', false)
+      .classed('highlighted', false)
+      .classed('path-to-dv', false);
+    tooltip.style('opacity', 0);
+  }
+
+  function showTooltip(graphX, graphY, title, detail) {
+    tooltip.html(`<div class="driver-name">${title}</div><div class="state-label">${detail}</div>`);
+    // Position near the node, accounting for zoom transform
+    const transform = g.attr('transform');
+    let tx = 0, ty = 0, sc = 1;
+    if (transform) {
+      const m = transform.match(/translate\(([\d.e+-]+),?\s*([\d.e+-]+)\)\s*scale\(([\d.e+-]+)\)/);
+      if (m) { tx = +m[1]; ty = +m[2]; sc = +m[3]; }
+    }
+    const sx = graphX * sc + tx;
+    const sy = graphY * sc + ty;
+    tooltip
+      .style('left', (sx + 35) + 'px')
+      .style('top', (sy - 20) + 'px')
+      .style('opacity', 1);
+  }
+
+  function onNodeClick(code) {
+    if (code === 'DV') return;
+    window.ipc.postMessage(JSON.stringify({ type: 'click', code: code }));
+  }
+
+  // --- Public API (called from Rust) ---
+
+  window.updateDAG = function(jsonStr) {
+    modelData = JSON.parse(jsonStr);
+    renderGraph();
+  };
+
+  window.updateStates = function(jsonStr) {
+    const states = JSON.parse(jsonStr);
+    const stateMap = {};
+    states.forEach(s => { stateMap[s.code] = s.state; });
+
+    // Update model data in memory
+    if (modelData) {
+      modelData.drivers.forEach(d => {
+        if (stateMap[d.code]) d.state = stateMap[d.code];
+      });
+    }
+
+    // Update node classes without relayout
+    g.selectAll('.node').each(function() {
+      const el = d3.select(this);
+      const code = el.attr('data-code');
+      if (code && stateMap[code]) {
+        // Remove old state classes
+        el.attr('class', `node ${stateClass(stateMap[code])}`);
+      }
+    });
+  };
+
+  // Handle resize
+  window.addEventListener('resize', () => {
+    if (graphLayout) fitToView();
+  });
+
+  init();
+
+  // Signal readiness to the Rust host — the webview stays hidden
+  // until this fires to avoid a white flash during initial load.
+  window.ipc.postMessage(JSON.stringify({ type: 'ready' }));
+})();
+</script>
+</body>
+</html>

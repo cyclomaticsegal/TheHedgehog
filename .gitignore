@@ -1,0 +1,31 @@
+# Environment and secrets
+.env
+
+# Build artifacts
+/target/
+
+# Vendored JS dependencies
+vendor/dexter/node_modules/
+
+# Local data
+/data/
+
+# Screenshots / reference images (may contain sensitive UI state)
+/learning-images/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code project-local state
+.claude/
+
+# Substack post drafts (private, never committed)
+docs/published/substack-*.md

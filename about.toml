@@ -1,0 +1,42 @@
+# cargo-about configuration for THIRD-PARTY-LICENSES.html generation.
+# Run: cargo about generate about.hbs -o THIRD-PARTY-LICENSES.html
+#
+# `accepted` lists every SPDX license expression present in the resolved
+# dependency graph. The set was derived from a full `cargo metadata` audit
+# (see commit history). Any new license appearing in a future dep update
+# will fail generation until reviewed and added here intentionally.
+
+accepted = [
+    # Permissive — the bulk of the Rust ecosystem
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "0BSD",
+
+    # Public domain dedications
+    "Unlicense",
+    "CC0-1.0",
+
+    # Weak (file-level) copyleft — compatible with MIT for combined works
+    "MPL-2.0",
+
+    # Specialty
+    "Unicode-3.0",         # Unicode data tables
+    "OFL-1.1",             # Open Font License (embedded fonts)
+    "Ubuntu-font-1.0",     # Ubuntu Font License (embedded fonts)
+    "CDLA-Permissive-2.0", # Community Data License Agreement (data bundles)
+]
+
+# Treat first-party crates as private — they don't appear in the third-party
+# bundle. `[private] ignore = true` skips workspace members and any path
+# dependencies that don't come from a registry, which covers both
+# `the-hedgehog` (workspace root) and `fiftyone-folds` (vendored path dep,
+# proprietary and owned by the same author).
+[private]
+ignore = true

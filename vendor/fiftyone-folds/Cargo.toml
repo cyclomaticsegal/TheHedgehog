@@ -1,0 +1,21 @@
+[package]
+name = "fiftyone-folds"
+version = "0.1.0"
+edition = "2021"
+description = "Rust client library for the 51Folds Bayesian modelling API"
+license = "LicenseRef-Proprietary"
+license-file = "LICENSE"
+publish = false
+rust-version = "1.70"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+wiremock = "0.6"

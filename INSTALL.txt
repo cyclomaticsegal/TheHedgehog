@@ -1,0 +1,91 @@
+The Hedgehog — Preview 0.1
+==========================
+
+Welcome. This is an early-preview build of The Hedgehog, a causal,
+probabilistic monitoring dashboard for capital-markets regimes. It is
+not signed by Apple or Microsoft, so the first time you launch it your
+operating system will warn you. The instructions below walk you through
+it.
+
+FIRST-RUN INSTRUCTIONS
+----------------------
+
+1. Set up your API keys.
+
+   - In this folder you will find a file named `.env.example`. Make a
+     copy of it and name the copy `.env` (no `.example` suffix). Keep
+     the copy in this same folder, alongside the binary.
+   - Open the new `.env` file with any text editor and fill in your
+     keys. The required ones are:
+
+       FRED_API_KEY          — free, https://fred.stlouisfed.org/docs/api/api_key.html
+       ALPHA_VANTAGE_API_KEY — free, https://www.alphavantage.co/support/#api-key
+
+     Optional (only needed if you want to use the corresponding feature):
+
+       FOLDS_API_KEY         — https://51folds.ai (Bayesian model creation)
+       ANTHROPIC_API_KEY     — https://console.anthropic.com/ (Claude AI Analysis)
+       OPENAI_API_KEY        — https://platform.openai.com/api-keys (GPT AI Analysis)
+
+     For AI Analysis you only need ONE of Anthropic or OpenAI, not both.
+
+   The Hedgehog will launch without keys, but the dashboard will be
+   empty until at least FRED and Alpha Vantage are configured. The app
+   reads `.env` from the folder where the binary lives, so as long as
+   `.env` is next to `the-hedgehog` (or `the-hedgehog.exe`), it will
+   be picked up however you launch the app.
+
+2. Launch the application.
+
+   macOS:
+     - First time only: right-click `the-hedgehog`, choose Open, then
+       click Open in the dialog. macOS will not let you double-click an
+       unsigned app on first launch — this is normal.
+     - From the second launch onward, double-click works as usual.
+
+   Windows:
+     - Double-click `the-hedgehog.exe`. Windows SmartScreen may show
+       "Windows protected your PC" with an "unrecognized publisher"
+       warning. Click "More info", then "Run anyway".
+     - You only need to do this the first time.
+
+   Linux:
+     - From a terminal in this folder: `./the-hedgehog`
+     - You may need to mark it executable first: `chmod +x the-hedgehog`
+
+3. The dashboard will load. The initial data fetch from FRED + Alpha
+   Vantage takes a minute or two on first launch and is cached after.
+
+SUPPORTED PLATFORMS
+-------------------
+
+This build is provided for:
+
+  - macOS (Apple Silicon and Intel — universal binary)
+  - Linux x86_64 (glibc — Ubuntu 22.04+, Debian 12+, Fedora 38+, etc.)
+  - Windows 10/11 x86_64
+
+NOT currently supported:
+
+  - Linux on ARM (Raspberry Pi, AWS Graviton, Apple Silicon Asahi)
+  - Linux distributions using musl (Alpine, Void, etc.)
+  - 32-bit operating systems
+
+If you need one of those, you will have to build from source for now.
+
+KNOWN LIMITATIONS
+-----------------
+
+This is preview software. Things may break. The 51Folds revert-to-original
+feature is known to be imperfect — driver states will be restored exactly,
+but outcome probabilities may drift slightly due to a known upstream bug
+in the 51Folds public API. The in-app revert dialog warns you about this.
+
+For exact-revert behaviour, use the native 51Folds web app at
+https://app.51folds.ai
+
+SOURCE AND ISSUES
+-----------------
+
+Source code:  https://github.com/cyclomaticsegal/TheHedgehog
+Bug reports:  https://github.com/cyclomaticsegal/TheHedgehog/issues

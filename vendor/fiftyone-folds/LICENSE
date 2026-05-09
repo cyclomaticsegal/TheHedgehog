@@ -1,0 +1,16 @@
+Copyright (c) 2026 Simon Segal. All rights reserved.
+
+This software is the proprietary 51Folds Rust SDK, a thin client wrapper for
+the 51Folds API (https://51folds.ai).
+
+No license is granted for use, modification, distribution, sublicensing, or
+sale of this software except as expressly authorized in writing by the
+copyright holder.
+
+This SDK is vendored into The Hedgehog (https://github.com/cyclomaticsegal/TheHedgehog)
+for the convenience of building that application from source. The Hedgehog
+application code is separately licensed under the MIT License (see the
+repository root LICENSE file). That MIT license does NOT extend to this
+vendored SDK.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.

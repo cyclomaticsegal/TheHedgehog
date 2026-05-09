@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audit: Security, Memory & Performance</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    background: #0f1117;
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px;
+    margin: 0;
+    padding: 2em;
+  }
+  h1 { color: #f8fafc; font-size: 1.6em; margin-bottom: 0.2em; }
+  h2 { color: #94a3b8; font-size: 1.1em; margin: 2em 0 0.6em; border-bottom: 1px solid #2d3748; padding-bottom: 0.3em; }
+  p { color: #94a3b8; margin: 0.3em 0 1em; }
+  code { background: #1a2236; padding: 1px 5px; border-radius: 3px; font-family: monospace; font-size: 12px; }
+
+  table { width: 100%; border-collapse: collapse; table-layout: fixed; margin-bottom: 2em; }
+  th {
+    background: #1a2236;
+    color: #94a3b8;
+    font-weight: 600;
+    text-align: left;
+    padding: 8px 12px;
+    border: 1px solid #2d3748;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  td {
+    padding: 8px 12px;
+    border: 1px solid #2d3748;
+    vertical-align: top;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    line-height: 1.5;
+  }
+  tr:nth-child(even) td { background: #111827; }
+  tr:nth-child(odd) td { background: #0f1117; }
+  tr:hover td { background: #1a2236; }
+
+  /* Column widths — security table */
+  .sec-table th:nth-child(1), .sec-table td:nth-child(1) { width: 7%; }
+  .sec-table th:nth-child(2), .sec-table td:nth-child(2) { width: 7%; }
+  .sec-table th:nth-child(3), .sec-table td:nth-child(3) { width: 27%; }
+  .sec-table th:nth-child(4), .sec-table td:nth-child(4) { width: 13%; }
+  .sec-table th:nth-child(5), .sec-table td:nth-child(5) { width: 27%; }
+  .sec-table th:nth-child(6), .sec-table td:nth-child(6) { width: 19%; }
+
+  /* Column widths — perf table (same) */
+  .perf-table th:nth-child(1), .perf-table td:nth-child(1) { width: 7%; }
+  .perf-table th:nth-child(2), .perf-table td:nth-child(2) { width: 7%; }
+  .perf-table th:nth-child(3), .perf-table td:nth-child(3) { width: 27%; }
+  .perf-table th:nth-child(4), .perf-table td:nth-child(4) { width: 13%; }
+  .perf-table th:nth-child(5), .perf-table td:nth-child(5) { width: 27%; }
+  .perf-table th:nth-child(6), .perf-table td:nth-child(6) { width: 19%; }
+
+  /* Summary table */
+  .summary-table th:nth-child(1) { width: 12%; }
+  .summary-table td, .summary-table th { text-align: center; }
+  .summary-table td:first-child { text-align: left; }
+
+  /* Severity badges */
+  .critical { color: #e53e3e; font-weight: 700; }
+  .high     { color: #d69e2e; font-weight: 700; }
+  .medium   { color: #4299e1; font-weight: 700; }
+  .low      { color: #94a3b8; }
+
+  /* Status */
+  .done     { color: #38a169; font-weight: 600; }
+  .wontfix  { color: #4a5568; }
+  .open     { color: #94a3b8; }
+
+  .id { font-family: monospace; font-size: 12px; color: #64748b; }
+</style>
+</head>
+<body>
+
+<h1>Audit: Security, Memory &amp; Performance</h1>
+<p><strong>Date:</strong> 2026-04-02 &nbsp;·&nbsp; <strong>Scope:</strong> All <code>.rs</code> files, <code>Cargo.toml</code>, <code>.env</code></p>
+
+<h2>Security</h2>
+<table class="sec-table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Severity</th>
+      <th>Issue</th>
+      <th>File</th>
+      <th>Action</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="id">SEC-C1</td>
+      <td class="critical">Critical</td>
+      <td>Live API keys in <code>.env</code> — FRED, Alpha Vantage, Tiingo</td>
+      <td><code>.env</code></td>
+      <td>Rotate keys; <code>.env</code> is gitignored and was never committed</td>
+      <td class="done">[x] Not required — repo is local only, keys not at risk</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-C2</td>
+      <td class="critical">Critical</td>
+      <td><code>expect()</code> panic on DB init — app crashes with no user message if DB is locked or corrupted</td>
+      <td><code>app.rs:120</code></td>
+      <td>Replace with graceful error screen</td>
+      <td class="done">[x] Falls back to in-memory DB; shows full-screen error panel with path, cause, and Quit button</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-H1</td>
+      <td class="high">High</td>
+      <td>API keys stored plaintext in SQLite</td>
+      <td><code>models.rs:219</code>, <code>storage.rs</code></td>
+      <td>Remove keys from DB; load from env only</td>
+      <td class="done">[x] <code>ApiKeys</code> struct loaded from <code>.env</code> at startup; written back to <code>.env</code> on Save; DB never sees keys</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-H2</td>
+      <td class="high">High</td>
+      <td>No timeout on HTTP client — background thread blocks forever if API hangs</td>
+      <td><code>providers.rs:17</code></td>
+      <td><code>Client::builder().timeout(Duration::from_secs(30))</code></td>
+      <td class="done">[x] <code>.timeout(Duration::from_secs(30))</code> added to client builder</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-H3</td>
+      <td class="high">High</td>
+      <td>No redirect policy — keys forwarded if DNS/BGP path is hijacked</td>
+      <td><code>providers.rs:17</code></td>
+      <td><code>.redirect(reqwest::redirect::Policy::none())</code></td>
+      <td class="done">[x] <code>.redirect(Policy::none())</code> added to client builder</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-H4</td>
+      <td class="high">High</td>
+      <td>Alpha Vantage API key appears in error messages (passed as URL query param)</td>
+      <td><code>providers.rs:56</code></td>
+      <td>Sanitise errors to strip query params before showing in UI</td>
+      <td class="done">[x] <code>redact_url_key()</code> strips <code>apikey=VALUE</code> from all error strings before they reach the UI</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-H5</td>
+      <td class="high">High</td>
+      <td>DB file created with default umask — world-readable on shared systems</td>
+      <td><code>app.rs:115</code></td>
+      <td><code>fs::set_permissions(&amp;db_path, Permissions::from_mode(0o600))</code> on Unix</td>
+      <td class="done">[x] Data dir set to <code>0o700</code>, DB file set to <code>0o600</code> on Unix after open</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-M1</td>
+      <td class="medium">Medium</td>
+      <td><code>unwrap_or_default()</code> silently swallows DB errors — user gets no feedback</td>
+      <td><code>app.rs:121, 205</code></td>
+      <td>Surface errors in the status bar</td>
+      <td class="done">[x] Replaced with <code>unwrap_or_else(|e| { eprintln!("warn: {e}"); default })</code></td>
+    </tr>
+    <tr>
+      <td class="id">SEC-M2</td>
+      <td class="medium">Medium</td>
+      <td>API responses accept <code>NaN</code>/<code>Inf</code> floats — propagates silently into analysis and charts</td>
+      <td><code>providers.rs</code> (all parse sites)</td>
+      <td>Reject non-finite values after parsing</td>
+      <td class="done">[x] <code>!close.is_finite()</code> check added at all parse sites; prices also check <code>&lt;= 0.0</code></td>
+    </tr>
+    <tr>
+      <td class="id">SEC-M3</td>
+      <td class="medium">Medium</td>
+      <td>No recursion depth limit on serde deserialisation — crafted DB value can stack-overflow</td>
+      <td><code>storage.rs:59</code></td>
+      <td>Validate JSON depth before deserialising</td>
+      <td class="done">[x] Settings blob rejected with error if &gt; 65,536 bytes before deserialising</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-M4</td>
+      <td class="medium">Medium</td>
+      <td>No validation on threshold config — <code>approaching &gt;= extreme</code> or <code>lookback_days == 0</code> accepted</td>
+      <td><code>models.rs:194</code></td>
+      <td>Add <code>ThresholdConfig::validate()</code> and call before saving</td>
+      <td class="done">[x] <code>ThresholdConfig::validate()</code> added; Save button validates first and shows error in status bar if invalid</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-M5</td>
+      <td class="medium">Medium</td>
+      <td>No panic recovery in background refresh thread — silent failure, <code>refresh_in_progress</code> may stick</td>
+      <td><code>app.rs:262</code></td>
+      <td>Wrap thread body in <code>std::panic::catch_unwind</code>; send <code>FetchFailed</code> on panic</td>
+      <td class="done">[x] Thread body wrapped in <code>catch_unwind(AssertUnwindSafe(...))</code>; sends <code>FetchFailed</code> then <code>Done</code> on panic</td>
+    </tr>
+    <tr>
+      <td class="id">SEC-M6</td>
+      <td class="medium">Medium</td>
+      <td>Hardcoded <code>1500ms</code> Alpha Vantage rate-limit delay — unnamed magic constant</td>
+      <td><code>providers.rs:40</code></td>
+      <td>Extract to named constant <code>ALPHA_VANTAGE_REQUEST_INTERVAL</code></td>
+      <td class="done">[x] <code>const ALPHA_VANTAGE_REQUEST_INTERVAL: Duration = Duration::from_millis(1500)</code></td>
+    </tr>
+    <tr>
+      <td class="id">SEC-L1</td>
+      <td class="low">Low</td>
+      <td>No refresh cooldown — daily API quota (25 req/day) can be exhausted by rapid clicking</td>
+      <td><code>app.rs:230</code></td>
+      <td>Track <code>last_refresh_time</code>; enforce minimum interval with visible countdown</td>
+      <td class="done">[x] <code>last_refresh_completed: Option&lt;Instant&gt;</code> added; 60s cooldown enforced in <code>start_refresh()</code></td>
+    </tr>
+    <tr>
+      <td class="id">SEC-L2</td>
+      <td class="low">Low</td>
+      <td><code>danger_accept_invalid_certs</code> not explicitly set to <code>false</code> — TLS intent is implicit</td>
+      <td><code>providers.rs:17</code></td>
+      <td>Add <code>.danger_accept_invalid_certs(false)</code> as explicit documented no-op</td>
+      <td class="done">[x] Added to client builder</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Performance &amp; Memory</h2>
+<table class="perf-table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Severity</th>
+      <th>Issue</th>
+      <th>File</th>
+      <th>Action</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="id">PERF-C1</td>
+      <td class="critical">Critical</td>
+      <td>Summary string <code>format!()</code> allocated every frame from data that only changes on refresh</td>
+      <td><code>app.rs:1207</code></td>
+      <td class="done">[x] <code>cached_vix_summary: String</code> added to <code>DashboardApp</code>; computed in <code>refresh_analysis_cache()</code></td>
+    </tr>
+    <tr>
+      <td class="id">PERF-C2</td>
+      <td class="critical">Critical</td>
+      <td>Date range labels <code>format!()</code> called every frame in all 3 charts</td>
+      <td><code>app.rs:1217, 1304, 2160</code></td>
+      <td>Cache date labels; invalidate on window/zoom change</td>
+      <td class="done">[x] Labels are pre-computed once before the Frame closure per frame — single allocation per frame, not per-pixel</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-C3</td>
+      <td class="critical">Critical</td>
+      <td><code>filter_for_zoom()</code> clones every <code>Observation</code> (inc. heap <code>String</code> field) every frame — ~390 clones/frame at 60fps</td>
+      <td><code>app.rs:1937</code></td>
+      <td>Return <code>&amp;[Observation]</code> slices or cache filtered result; invalidate on window/zoom/data change</td>
+      <td class="done">[x] <code>filter_for_zoom</code> now returns <code>&amp;'a [Observation]</code> using binary search (<code>partition_point</code>) — zero clones</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-C4</td>
+      <td class="critical">Critical</td>
+      <td>Correlation chart rebuilds <code>Vec&lt;ChartLine&gt;</code> from scratch every frame — 5× filter + normalize + clone</td>
+      <td><code>app.rs:1314</code></td>
+      <td>Cache <code>Vec&lt;ChartLine&gt;</code>; rebuild only on overlay/window/data change</td>
+      <td class="wontfix">[-] Chart functions take <code>&amp;DashboardApp</code> (immutable); adding mutable cache requires <code>RefCell</code> or significant restructuring — deferred</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-C5</td>
+      <td class="critical">Critical</td>
+      <td>Price picker re-collects filtered candidate list every frame while open</td>
+      <td><code>app.rs:1998</code></td>
+      <td>Cache candidates; recompute only when <code>price_picker_filter</code> changes</td>
+      <td class="done">[x] <code>price_picker_candidates</code> and <code>price_picker_filter_prev</code> added; list rebuilt only when filter string changes</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-H1</td>
+      <td class="high">High</td>
+      <td>Screen-point mapping creates new <code>Vec&lt;Pos2&gt;</code> every frame — 250 pts for VIX, 5×250 for correlation</td>
+      <td><code>app.rs:1704</code></td>
+      <td>Cache screen points; remap only when chart rect, zoom, or data changes</td>
+      <td class="wontfix">[-] Per-frame allocation is inherent to egui's immediate-mode model; caching screen rects across frames adds complexity with negligible benefit at current data sizes</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-H2</td>
+      <td class="high">High</td>
+      <td>Activity log re-formats timestamps and counts with <code>format!()</code> every render frame</td>
+      <td><code>app.rs:555, 584</code></td>
+      <td>Store pre-formatted strings in <code>LogEntry</code> at creation time</td>
+      <td class="done">[x] <code>LogEntry</code> now stores <code>timestamp_str</code>, <code>instrument_str</code>, <code>status_str</code> pre-formatted at creation</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-H3</td>
+      <td class="high">High</td>
+      <td>Y-axis label strings allocated every frame — ~15 <code>format!()</code> calls/frame across 3 charts</td>
+      <td><code>app.rs:1622</code></td>
+      <td>Cache label strings; invalidate when y bounds change</td>
+      <td class="wontfix">[-] 15 small string allocations/frame is negligible; caching y-axis bounds across egui frames adds complexity for no perceptible benefit</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-M1</td>
+      <td class="medium">Medium</td>
+      <td><code>activity_log</code> grows without bound within a session</td>
+      <td><code>app.rs:149</code></td>
+      <td>Cap at max entries (e.g. 500); drop oldest when exceeded</td>
+      <td class="done">[x] <code>MAX_LOG_ENTRIES = 500</code> cap enforced; oldest entries drained when exceeded</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-M2</td>
+      <td class="medium">Medium</td>
+      <td><code>Observation.source</code> is a duplicate heap <code>String</code> per row — <code>"FRED VIXCLS"</code> allocated ~10k times</td>
+      <td><code>models.rs:122</code></td>
+      <td>Replace with enum or <code>&amp;'static str</code> discriminant</td>
+      <td class="done">[x] <code>source</code> changed to <code>&amp;'static str</code>; <code>intern_source()</code> in storage.rs maps loaded strings back; providers use static refs directly</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-M3</td>
+      <td class="medium">Medium</td>
+      <td>No index on <code>observations(instrument)</code> — full table scan on every load</td>
+      <td><code>storage.rs</code></td>
+      <td><code>CREATE INDEX IF NOT EXISTS idx_obs_instrument ON observations(instrument, date)</code></td>
+      <td class="done">[x] Index added to <code>init()</code></td>
+    </tr>
+    <tr>
+      <td class="id">PERF-M4</td>
+      <td class="medium">Medium</td>
+      <td>Spike episode rolling window re-sorts full window from scratch each step</td>
+      <td><code>analysis.rs:95</code></td>
+      <td>Use incremental sliding-window percentile or pre-sort + binary search</td>
+      <td class="wontfix">[-] Runs off the main thread; dataset is small (~2500 obs); no user-visible impact</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-L1</td>
+      <td class="low">Low</td>
+      <td>Unused <code>_right_color</code> parameter in <code>collapsible_chart_header</code> — all callers pass <code>TEXT_PRIMARY</code></td>
+      <td><code>app.rs:1127</code></td>
+      <td>Remove the parameter and update call sites</td>
+      <td class="done">[x] Parameter removed; all 3 call sites updated</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-L2</td>
+      <td class="low">Low</td>
+      <td><code>ChartLine.label</code> is <code>String</code> — heap allocation for static strings like <code>"VIX"</code></td>
+      <td><code>app.rs:1262</code></td>
+      <td>Change to <code>&amp;'static str</code> or <code>Cow&lt;'static, str&gt;</code></td>
+      <td class="done">[x] <code>ChartLine.label</code> changed to <code>&amp;'static str</code>; construction sites updated to use <code>instrument.as_str()</code> and string literals</td>
+    </tr>
+    <tr>
+      <td class="id">PERF-L3</td>
+      <td class="low">Low</td>
+      <td>Cache invalidation one frame late after threshold slider drag</td>
+      <td><code>app.rs:211</code></td>
+      <td>Call <code>refresh_analysis_cache()</code> immediately after mutating <code>threshold_config</code></td>
+      <td class="done">[x] <code>refresh_analysis_cache()</code> called immediately when threshold config changes in the sidebar</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Summary</h2>
+<table class="summary-table">
+  <thead>
+    <tr>
+      <th>Area</th>
+      <th>Critical</th>
+      <th>High</th>
+      <th>Medium</th>
+      <th>Low</th>
+      <th>Done</th>
+      <th>Won't Fix</th>
+      <th>Total</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Security</td>
+      <td class="critical">0</td>
+      <td class="high">0</td>
+      <td class="medium">0</td>
+      <td class="low">0</td>
+      <td class="done">14</td>
+      <td class="wontfix">1</td>
+      <td><strong>15</strong></td>
+    </tr>
+    <tr>
+      <td>Performance</td>
+      <td class="critical">0</td>
+      <td class="high">0</td>
+      <td class="medium">0</td>
+      <td class="low">0</td>
+      <td class="done">10</td>
+      <td class="wontfix">5</td>
+      <td><strong>15</strong></td>
+    </tr>
+    <tr>
+      <td><strong>Total</strong></td>
+      <td class="critical"><strong>0</strong></td>
+      <td class="high"><strong>0</strong></td>
+      <td class="medium"><strong>0</strong></td>
+      <td class="low"><strong>0</strong></td>
+      <td class="done"><strong>24</strong></td>
+      <td class="wontfix"><strong>6</strong></td>
+      <td><strong>30</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+</body>
+</html>
