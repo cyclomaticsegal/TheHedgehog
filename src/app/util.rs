@@ -164,3 +164,88 @@ pub(super) fn format_overlay_label(keys: &[String]) -> String {
         format!("{}+{}", head.join("/"), names.len() - 3)
     }
 }
+
+/// Launch Obsidian and open `path` as a vault. On macOS we use `open
+/// -a Obsidian`, which registers a first-time-opened folder as a vault
+/// automatically. Other platforms fall back to a best-effort
+/// `obsidian://` URL.
+pub(super) fn open_in_obsidian(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-a")
+            .arg("Obsidian")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // The `obsidian://open?path=` URL is a stable scheme handler.
+        let url = format!(
+            "obsidian://open?path={}",
+            urlencoding_minimal(&path.to_string_lossy())
+        );
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("cmd").args(["/C", "start", "", &url]).spawn()?;
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            std::process::Command::new("xdg-open").arg(&url).spawn()?;
+        }
+        Ok(())
+    }
+}
+
+/// Tiny URL-encoder for paths — enough for the `obsidian://` scheme on
+/// non-macOS platforms. Spaces and a handful of structural characters,
+/// nothing fancy.
+#[cfg(not(target_os = "macos"))]
+fn urlencoding_minimal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' => out.push(c),
+            _ => {
+                let mut buf = [0u8; 4];
+                for b in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("%{b:02X}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Open the OS file manager focused on `path`. Best-effort: errors are
+/// returned to the caller, who decides whether to surface them.
+pub(super) fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()?;
+        Ok(())
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        // Most Linux file managers don't accept a "select this file"
+        // flag; open the parent directory instead.
+        let target = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        std::process::Command::new("xdg-open").arg(target).spawn()?;
+        Ok(())
+    }
+}

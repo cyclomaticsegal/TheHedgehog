@@ -34,7 +34,11 @@ pub(super) enum LlmPoll {
 
 impl LlmTask {
     pub(super) fn new() -> Self {
-        Self { in_flight: false, rx: None, error: None }
+        Self {
+            in_flight: false,
+            rx: None,
+            error: None,
+        }
     }
 
     pub(super) fn start(&mut self, rx: Receiver<AiEvent>) {
@@ -210,8 +214,7 @@ impl FoldsTask {
                     if let Some(canonical_idx) = CANONICAL_STATES
                         .iter()
                         .position(|c| c.eq_ignore_ascii_case(&raw_current_state))
-                        && let Some((descriptor_name, _)) =
-                            state_options.get(canonical_idx)
+                        && let Some((descriptor_name, _)) = state_options.get(canonical_idx)
                     {
                         return descriptor_name.clone();
                     }
@@ -232,9 +235,7 @@ impl FoldsTask {
 
     /// True when the model has completed successfully.
     pub(super) fn is_complete(&self) -> bool {
-        self.model
-            .as_ref()
-            .is_some_and(|m| m.is_complete())
+        self.model.as_ref().is_some_and(|m| m.is_complete())
     }
 
     pub(super) fn poll(&mut self) {
@@ -282,7 +283,9 @@ impl FoldsTask {
     }
 
     fn poll_refresh(&mut self) {
-        let Some(rx) = self.refresh_rx.take() else { return };
+        let Some(rx) = self.refresh_rx.take() else {
+            return;
+        };
         loop {
             match rx.try_recv() {
                 Ok(FoldsResult::Refreshed(model)) => {
@@ -326,8 +329,7 @@ impl FoldsTask {
     pub(super) fn load_from_json(&mut self, json: &str) {
         match serde_json::from_str::<fiftyone_folds::ModelResponse>(json) {
             Ok(model) => {
-                let is_stub =
-                    model.current.outcomes.is_empty() || model.drivers.is_empty();
+                let is_stub = model.current.outcomes.is_empty() || model.drivers.is_empty();
                 if is_stub {
                     eprintln!(
                         "[folds] load_from_json: stub detected for model_id={:?} \
@@ -373,10 +375,7 @@ impl FoldsBacklog {
     /// Count of builds that are still working. Foreground is counted
     /// separately by callers — this function only reports the backlog.
     pub(super) fn active_count(&self) -> usize {
-        self.background
-            .values()
-            .filter(|t| t.in_flight)
-            .count()
+        self.background.values().filter(|t| t.in_flight).count()
             + self.pending_creates.iter().filter(|t| t.in_flight).count()
     }
 
@@ -632,12 +631,73 @@ impl SplashState {
     }
 
     pub(super) fn elapsed(&self) -> std::time::Duration {
-        self.shown_at
-            .map(|t| t.elapsed())
-            .unwrap_or_default()
+        self.shown_at.map(|t| t.elapsed()).unwrap_or_default()
     }
 
     pub(super) fn dismiss(&mut self) {
         self.shown_at = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Obsidian export task — writes a vault to disk on a background thread.
+// ---------------------------------------------------------------------------
+
+pub(super) enum ObsidianEvent {
+    Done(std::path::PathBuf),
+    Failed(String),
+}
+
+pub(super) struct ObsidianTask {
+    pub(super) in_flight: bool,
+    pub(super) rx: Option<Receiver<ObsidianEvent>>,
+    pub(super) error: Option<String>,
+    /// Most recent successful export path. Kept after completion so the
+    /// model header can show "Exported to ..." with a Reveal link until
+    /// the user navigates away or starts a new export.
+    pub(super) last_exported: Option<std::path::PathBuf>,
+}
+
+impl ObsidianTask {
+    pub(super) fn new() -> Self {
+        Self {
+            in_flight: false,
+            rx: None,
+            error: None,
+            last_exported: None,
+        }
+    }
+
+    pub(super) fn start(&mut self, rx: Receiver<ObsidianEvent>) {
+        self.in_flight = true;
+        self.rx = Some(rx);
+        self.error = None;
+        self.last_exported = None;
+    }
+
+    pub(super) fn poll(&mut self) {
+        if !self.in_flight {
+            return;
+        }
+        let Some(rx) = self.rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(ObsidianEvent::Done(path)) => {
+                self.in_flight = false;
+                self.last_exported = Some(path);
+            }
+            Ok(ObsidianEvent::Failed(err)) => {
+                self.in_flight = false;
+                self.error = Some(err);
+            }
+            Err(TryRecvError::Empty) => {
+                self.rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.in_flight = false;
+                self.error = Some("Obsidian export thread disconnected unexpectedly.".to_owned());
+            }
+        }
     }
 }

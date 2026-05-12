@@ -30,7 +30,8 @@ use sidebar::{
     sidebar_vix_summary,
 };
 use tasks::{
-    FoldsBacklog, FoldsTask, LlmPoll, LlmTask, ResearchTerminal, SplashState, TrayRow,
+    FoldsBacklog, FoldsTask, LlmPoll, LlmTask, ObsidianEvent, ObsidianTask, ResearchTerminal,
+    SplashState, TrayRow,
 };
 use views::{
     CentralView, DriverDetailSection, LogEntry, LogStatus, ModelView, PricePickerAction, StatusKind,
@@ -38,8 +39,9 @@ use views::{
 };
 use theme::*;
 use util::{
-    database_path, filter_for_zoom, interpolate_at, map_val, sh_single_quote,
-    split_off_hypothesis, truncate_with_ellipsis, update_env_content, validate_model_name,
+    database_path, filter_for_zoom, interpolate_at, map_val, open_in_obsidian,
+    reveal_in_file_manager, sh_single_quote, split_off_hypothesis, truncate_with_ellipsis,
+    update_env_content, validate_model_name,
 };
 use chrono::Utc;
 use eframe::egui::{
@@ -118,6 +120,7 @@ pub struct DashboardApp {
     report_inferences: Vec<SavedInference>,
     report_task: LlmTask,
     report_result: Option<String>,
+    obsidian_task: ObsidianTask,
     report_markdown_cache: egui_commonmark::CommonMarkCache,
     /// The inference the user most recently opened from the Report list.
     /// Persists across navigation so returning from the 51Folds outcome
@@ -595,6 +598,7 @@ impl DashboardApp {
             report_inferences: Vec::new(),
             report_task: LlmTask::new(),
             report_result: None,
+            obsidian_task: ObsidianTask::new(),
             report_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             last_selected_report_id: None,
             report_selection: HashSet::new(),
@@ -2263,6 +2267,41 @@ latest close. Keep SECONDARY instruments as corroborative mentions only.\n",
 
         thread::spawn(move || {
             ai::run_analysis(request, tx);
+        });
+    }
+
+    /// Open a folder picker and kick off an Obsidian vault export of
+    /// the currently loaded model. The export runs on a background
+    /// thread and reports back via `obsidian_task`.
+    fn start_obsidian_export(&mut self) {
+        // Pre-flight — the button is only shown when a model is loaded,
+        // but check anyway in case state shifts between click and dispatch.
+        let model = match self.folds_task.model.as_ref() {
+            Some(m) => (**m).clone(),
+            None => {
+                self.obsidian_task.error =
+                    Some("No model loaded — open a completed model first.".to_owned());
+                return;
+            }
+        };
+
+        let parent = match rfd::FileDialog::new()
+            .set_title("Choose where to save the Obsidian vault")
+            .pick_folder()
+        {
+            Some(p) => p,
+            None => return, // user cancelled — silent.
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.obsidian_task.start(rx);
+
+        thread::spawn(move || {
+            let evt = match crate::obsidian::export_model(&model, &parent) {
+                Ok(path) => ObsidianEvent::Done(path),
+                Err(err) => ObsidianEvent::Failed(format!("{err:#}")),
+            };
+            let _ = tx.send(evt);
         });
     }
 
@@ -5606,6 +5645,7 @@ impl eframe::App for DashboardApp {
         self.poll_report();
         self.poll_folds();
         self.poll_research_terminal();
+        self.obsidian_task.poll();
         if self.folds_task.in_flight {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -5829,10 +5869,57 @@ impl DashboardApp {
                 }
 
                 // Model navigation (only when 51Folds tab is active)
+                let mut trigger_obsidian = false;
                 if self.central_view == CentralView::Model {
                     ui.selectable_value(&mut self.model_view, ModelView::Outcome, "Outcome");
                     ui.selectable_value(&mut self.model_view, ModelView::DriverList, "Drivers");
                     ui.selectable_value(&mut self.model_view, ModelView::VisualMap, "Visual Map");
+
+                    // Obsidian export: live alongside the Visual Map tab
+                    // since both are "model viewers". Only enabled once a
+                    // model is loaded; status surfaces inline so the user
+                    // sees the result without leaving this row.
+                    ui.separator();
+                    let model_loaded = self.folds_task.model.is_some();
+                    let btn_label = if self.obsidian_task.in_flight {
+                        "Exporting…"
+                    } else {
+                        "Export to Obsidian"
+                    };
+                    let resp = ui.add_enabled(
+                        model_loaded && !self.obsidian_task.in_flight,
+                        egui::Button::new(btn_label),
+                    );
+                    if resp.clicked() {
+                        trigger_obsidian = true;
+                    }
+                    if self.obsidian_task.in_flight {
+                        ui.spinner();
+                    } else if let Some(path) = self.obsidian_task.last_exported.clone() {
+                        if ui
+                            .small_button("Open in Obsidian")
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            let _ = open_in_obsidian(&path);
+                        }
+                        if ui
+                            .small_button("Reveal")
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            let _ = reveal_in_file_manager(&path);
+                        }
+                    } else if let Some(err) = self.obsidian_task.error.clone() {
+                        ui.label(
+                            RichText::new(format!("✗ {err}"))
+                                .size(12.0)
+                                .color(Color32::from_rgb(220, 120, 120)),
+                        );
+                    }
+                }
+                if trigger_obsidian {
+                    self.start_obsidian_export();
                 }
 
                 // Report — always available (covers both AI and Research analyses)
