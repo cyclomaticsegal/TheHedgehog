@@ -8,6 +8,7 @@ mod models;
 mod providers;
 mod dag;
 mod eval;
+mod obsidian;
 mod storage;
 
 pub(crate) const USER_AGENT: &str = "the-hedgehog/0.1.0-preview";
