@@ -349,6 +349,7 @@ The project maintains Architecture Decision Records in `docs/adr/`:
 | 0021 | Instrument set reduction: Bitcoin folded into monetary |
 | 0022 | Primary / secondary / tertiary prompt framework |
 | 0023 | 51Folds refresh: server-confirmed failure detection and retry |
+| 0024 | 51Folds tab as model registry: browser landing and context-aware sidebar |
 
 ## License
 

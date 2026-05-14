@@ -1,6 +1,6 @@
 use crate::models::{
-    AlertEvent, AlertLevel, AppSettings, FoldsModelRecord, Instrument, Observation,
-    SavedInference, FOLDS_STATUS_PENDING,
+    AlertEvent, AlertLevel, AppSettings, FoldsModelRecord, FoldsTheme, Instrument, Observation,
+    SavedInference, FOLDS_STATUS_PENDING, UNCATEGORIZED_THEME_NAME,
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
@@ -97,6 +97,24 @@ impl Storage {
 
             CREATE INDEX IF NOT EXISTS idx_folds_models_status
                 ON folds_models(status);
+
+            CREATE TABLE IF NOT EXISTS folds_themes (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL UNIQUE,
+                description  TEXT NOT NULL DEFAULT '',
+                sort_order   INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS folds_model_themes (
+                model_id     TEXT NOT NULL PRIMARY KEY,
+                theme_id     INTEGER NOT NULL REFERENCES folds_themes(id),
+                assigned_at  TEXT NOT NULL,
+                FOREIGN KEY (model_id) REFERENCES folds_models(model_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_folds_model_themes_theme
+                ON folds_model_themes(theme_id);
             "#,
         )?;
 
@@ -142,6 +160,132 @@ impl Storage {
                 self.conn.execute(sql, [])?;
             }
         }
+
+        // One-time bootstrap of the theme taxonomy. Idempotent: this
+        // only inserts rows when `folds_themes` is empty. After that
+        // the user manages themes via the in-app UI.
+        self.seed_themes_if_empty()?;
+
+        Ok(())
+    }
+
+    /// Bootstrap the five seed themes plus Uncategorized, and map the
+    /// existing 26 stored models to them. Runs once per database — a
+    /// non-empty `folds_themes` table makes this a no-op forever after.
+    /// Any `model_id` in the seed map that doesn't exist locally is
+    /// silently skipped; any local model not covered by the seed map
+    /// falls into Uncategorized.
+    fn seed_themes_if_empty(&self) -> Result<()> {
+        let theme_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM folds_themes", [], |row| row.get(0))?;
+        if theme_count > 0 {
+            return Ok(());
+        }
+
+        let now = Utc::now().to_rfc3339();
+
+        // (name, description, sort_order)
+        let themes: &[(&str, &str, i64)] = &[
+            (
+                "Crypto risk-on persistence",
+                "Bitcoin and crypto theses anchored on continued risk appetite, ETF flows, and the absence of systemic shocks.",
+                1,
+            ),
+            (
+                "Metals \u{2014} safe-haven & industrial",
+                "Silver and gold theses anchored on industrial demand, real rates, and safe-haven flows.",
+                2,
+            ),
+            (
+                "Energy commodities",
+                "Natural-gas and crude-oil theses anchored on supply/demand and geopolitical disruption.",
+                3,
+            ),
+            (
+                "Equities \u{2014} single-name conviction",
+                "Single-stock and equity-basket theses (TSLA, PLTR, BET, cislunar names).",
+                4,
+            ),
+            (
+                "Macro / volatility / FX",
+                "Dollar-index, VIX-itself, and other top-down macro theses.",
+                5,
+            ),
+            (
+                "Uncategorized",
+                "Models the user hasn't placed in a theme yet.",
+                99,
+            ),
+        ];
+
+        for (name, description, sort_order) in themes {
+            self.conn.execute(
+                "INSERT INTO folds_themes (name, description, sort_order, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![name, description, sort_order, now],
+            )?;
+        }
+
+        // Hand-derived assignment of the 26 models in the corpus as of
+        // 2026-05-14. Theme name keys must match the inserts above.
+        let crypto = "Crypto risk-on persistence";
+        let metals = "Metals \u{2014} safe-haven & industrial";
+        let energy = "Energy commodities";
+        let equities = "Equities \u{2014} single-name conviction";
+        let macro_fx = "Macro / volatility / FX";
+
+        let assignments: &[(&str, &str)] = &[
+            ("MT", crypto),
+            ("Lb", crypto),
+            ("Kb", crypto),
+            ("Ka", crypto),
+            ("KU", crypto),
+            ("K9", crypto),
+            ("K5", crypto),
+            ("Jz", crypto),
+            ("Jx", crypto),
+            ("Jw", crypto),
+            ("Ld", metals),
+            ("Ke", metals),
+            ("Kc", metals),
+            ("KT", metals),
+            ("Je", metals),
+            ("KV", energy),
+            ("Jv", energy),
+            ("Jk", energy),
+            ("Jf", energy),
+            ("Le", equities),
+            ("Lc", equities),
+            ("Kd", equities),
+            ("K3", equities),
+            ("K2", equities),
+            ("Kf", macro_fx),
+            ("KW", macro_fx),
+        ];
+
+        for (model_id, theme_name) in assignments {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO folds_model_themes (model_id, theme_id, assigned_at) \
+                 SELECT ?1, t.id, ?2 \
+                 FROM folds_themes t \
+                 WHERE t.name = ?3 \
+                 AND EXISTS (SELECT 1 FROM folds_models m WHERE m.model_id = ?1)",
+                params![model_id, now, theme_name],
+            )?;
+        }
+
+        // Catch-all: any local model not covered by the seed map ends
+        // up in Uncategorized so the cards landing has full coverage.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO folds_model_themes (model_id, theme_id, assigned_at) \
+             SELECT m.model_id, t.id, ?1 \
+             FROM folds_models m \
+             CROSS JOIN folds_themes t \
+             WHERE t.name = 'Uncategorized' \
+             AND NOT EXISTS (SELECT 1 FROM folds_model_themes a WHERE a.model_id = m.model_id)",
+            params![now],
+        )?;
 
         Ok(())
     }
@@ -439,6 +583,23 @@ impl Storage {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Load the stored `response_json` for a model by its 51Folds model_id.
+    /// Returns `None` when the model is still pending or no row exists.
+    /// Used by the browser to populate `viewed_task` on row-click without
+    /// disturbing the foreground `folds_task`.
+    pub fn load_folds_response_by_model_id(&self, model_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT response_json FROM folds_models WHERE model_id = ?1 AND response_json IS NOT NULL LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![model_id])?;
+        if let Some(row) = rows.next()? {
+            let json: String = row.get(0)?;
+            Ok(Some(json))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Load the full `response_json` for a 51Folds model linked to a
     /// given `ai_inferences` row. Returns `None` if no model exists for
     /// this inference or if the model hasn't completed yet.
@@ -486,6 +647,140 @@ impl Storage {
             map.insert(inf_id, (model_id, status));
         }
         Ok(map)
+    }
+
+    // -----------------------------------------------------------------
+    // Theme management — the cards landing reads `load_themes_with_counts`
+    // and the per-theme list reads `load_models_in_theme`. Renames and
+    // deletes touch only `folds_themes` (rename) or both tables in a
+    // transaction (delete reassigns models to Uncategorized first).
+    // -----------------------------------------------------------------
+
+    /// Load every theme with its current model count, ordered by
+    /// `sort_order ASC, name ASC`. Drives the cards landing.
+    pub fn load_themes_with_counts(&self) -> Result<Vec<(FoldsTheme, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.name, t.description, t.sort_order, t.created_at, \
+                    (SELECT COUNT(*) FROM folds_model_themes a WHERE a.theme_id = t.id) AS n \
+             FROM folds_themes t \
+             ORDER BY t.sort_order ASC, t.name ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created_str: String = row.get(4)?;
+            Ok((
+                FoldsTheme {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    sort_order: row.get(3)?,
+                    created_at: parse_rfc3339(&created_str),
+                },
+                row.get::<_, i64>(5)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Load every model in one theme, newest first. The caller can
+    /// re-sort by status if the dropdown selects something other than
+    /// the default; keeping SQL simple is worth one extra Rust sort.
+    pub fn load_models_in_theme(&self, theme_id: i64) -> Result<Vec<FoldsModelRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.model_id, m.status, m.created_at, m.completed_at, \
+                    m.last_polled_at, m.question, m.inference_id \
+             FROM folds_models m \
+             INNER JOIN folds_model_themes a ON a.model_id = m.model_id \
+             WHERE a.theme_id = ?1 \
+             ORDER BY m.created_at DESC",
+        )?;
+        let rows = stmt.query_map(params![theme_id], row_to_folds_record)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Load up to two example questions for a theme (newest first).
+    /// Drives the snippet preview on each theme card.
+    pub fn load_theme_sample_questions(&self, theme_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.question FROM folds_models m \
+             INNER JOIN folds_model_themes a ON a.model_id = m.model_id \
+             WHERE a.theme_id = ?1 \
+             ORDER BY m.created_at DESC LIMIT 2",
+        )?;
+        let rows = stmt
+            .query_map(params![theme_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Create a new theme, returning its id. Used by the new-model
+    /// picker's "+ Create new theme" path.
+    pub fn insert_theme(&self, name: &str, description: &str) -> Result<i64> {
+        let now = Utc::now().to_rfc3339();
+        // Place the new theme just below the highest non-Uncategorized
+        // theme so it visually sits with the user's normal taxonomy
+        // rather than pinning above Uncategorized's sort_order = 99.
+        let next_order: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM folds_themes \
+             WHERE name <> ?1",
+            params![UNCATEGORIZED_THEME_NAME],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "INSERT INTO folds_themes (name, description, sort_order, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, description, next_order, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Rename a theme. Model assignments use `theme_id` so the rename
+    /// is a single-column UPDATE and the assignments travel for free.
+    /// The UNIQUE constraint on `name` enforces no duplicates.
+    pub fn rename_theme(&self, theme_id: i64, new_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE folds_themes SET name = ?1 WHERE id = ?2",
+            params![new_name, theme_id],
+        )?;
+        Ok(())
+    }
+
+    /// Update a theme's description in place.
+    pub fn update_theme_description(&self, theme_id: i64, description: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE folds_themes SET description = ?1 WHERE id = ?2",
+            params![description, theme_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a theme, moving every model in it to Uncategorized in
+    /// the same transaction. Refuses to delete Uncategorized itself.
+    /// Returns the number of models that were reassigned.
+    pub fn delete_theme_reassigning_to_uncategorized(&mut self, theme_id: i64) -> Result<i64> {
+        let theme_name: String = self.conn.query_row(
+            "SELECT name FROM folds_themes WHERE id = ?1",
+            params![theme_id],
+            |row| row.get(0),
+        )?;
+        if theme_name == UNCATEGORIZED_THEME_NAME {
+            return Err(anyhow!("Cannot delete the Uncategorized theme."));
+        }
+        let uncategorized_id: i64 = self.conn.query_row(
+            "SELECT id FROM folds_themes WHERE name = ?1",
+            params![UNCATEGORIZED_THEME_NAME],
+            |row| row.get(0),
+        )?;
+        let tx = self.conn.transaction()?;
+        let moved = tx.execute(
+            "UPDATE folds_model_themes SET theme_id = ?1 WHERE theme_id = ?2",
+            params![uncategorized_id, theme_id],
+        )? as i64;
+        tx.execute(
+            "DELETE FROM folds_themes WHERE id = ?1",
+            params![theme_id],
+        )?;
+        tx.commit()?;
+        Ok(moved)
     }
 
     /// Update a row's status (and completed_at if terminal). Used by the
