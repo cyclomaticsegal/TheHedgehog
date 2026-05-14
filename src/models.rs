@@ -468,3 +468,19 @@ impl FoldsModelRecord {
         (now - self.created_at).num_seconds() >= FOLDS_SUSPECT_AFTER_SECS
     }
 }
+
+/// One row of the `folds_themes` table — a user-managed bucket that
+/// groups related Bayesian models on the 51Folds tab's cards landing.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct FoldsTheme {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub sort_order: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Reserved theme name — every install ships with this, and deleting
+/// a theme reassigns its models here so nothing is ever orphaned.
+pub const UNCATEGORIZED_THEME_NAME: &str = "Uncategorized";

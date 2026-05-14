@@ -3,6 +3,7 @@
 //! click/confirm signal out.
 
 use super::theme::*;
+use super::views::{ManageThemesEvent, ThemeDraft};
 use crate::models::{AlertLevel, Instrument, VixStatus};
 use eframe::egui::{
     self, Align2, Color32, Pos2, Rect, RichText, Sense, Stroke, Vec2,
@@ -625,4 +626,277 @@ pub(super) fn hedgehog_terminal_theme() -> egui_term::TerminalTheme {
         dim_white: String::from("#8e8e8e"),
     };
     egui_term::TerminalTheme::new(Box::new(palette))
+}
+
+// ---------------------------------------------------------------------------
+// Manage Themes dialog (Job 6)
+// ---------------------------------------------------------------------------
+
+/// Render the Manage Themes modal. Mutates `drafts` directly so name /
+/// description edits are visible the moment the user types; emits an
+/// event on commit (focus-loss or Enter), Close, Delete request, or
+/// Delete confirmation in the inline overlay.
+///
+/// `delete_confirm` is a small piece of dialog-local state owned by the
+/// caller: `Some(theme_id)` means "the confirm overlay is showing for
+/// this theme." `None` means the overlay is hidden.
+pub(super) fn render_manage_themes_dialog(
+    ctx: &egui::Context,
+    drafts: &mut [ThemeDraft],
+    delete_confirm: Option<i64>,
+) -> Option<ManageThemesEvent> {
+    let screen = ctx.screen_rect();
+    let win_w = 640.0_f32.min(screen.width() * 0.92);
+    let win_h = 520.0_f32.min(screen.height() * 0.88);
+
+    let mut event: Option<ManageThemesEvent> = None;
+
+    egui::Window::new("Manage themes")
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size([win_w, win_h])
+        .default_pos([
+            (screen.width() - win_w) / 2.0,
+            (screen.height() - win_h) / 2.0,
+        ])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("Manage themes")
+                    .size(16.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "Rename a theme or change its description \u{2014} all the models in it travel with it. \
+                     Delete sends the theme's models to Uncategorized.",
+                )
+                .size(12.0)
+                .color(TEXT_SECONDARY),
+            );
+            ui.add_space(12.0);
+
+            egui::ScrollArea::vertical()
+                .max_height(380.0)
+                .show(ui, |ui| {
+                    for draft in drafts.iter_mut() {
+                        egui::Frame::default()
+                            .fill(SURFACE)
+                            .stroke(egui::Stroke::new(1.0, BORDER))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "{} model{}",
+                                                draft.count,
+                                                if draft.count == 1 { "" } else { "s" }
+                                            ))
+                                            .size(11.0)
+                                            .color(TEXT_MUTED),
+                                        ),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if !draft.locked {
+                                                let btn = ui.add(
+                                                    egui::Button::new(
+                                                        RichText::new("Delete")
+                                                            .size(11.0)
+                                                            .color(ALERT_EXTREME_FG),
+                                                    )
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(egui::Stroke::new(1.0, BORDER))
+                                                    .corner_radius(4.0),
+                                                );
+                                                if btn.clicked() {
+                                                    event = Some(ManageThemesEvent::DeleteRequest(draft.id));
+                                                }
+                                            } else {
+                                                ui.label(
+                                                    RichText::new("(system theme)")
+                                                        .size(11.0)
+                                                        .color(TEXT_MUTED),
+                                                );
+                                            }
+                                        },
+                                    );
+                                });
+
+                                // Name field
+                                let name_response = ui.add_enabled(
+                                    !draft.locked,
+                                    egui::TextEdit::singleline(&mut draft.name)
+                                        .desired_width(560.0),
+                                );
+                                if name_response.changed() {
+                                    draft.name_dirty = true;
+                                    draft.error = None;
+                                }
+                                let name_commit = (name_response.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    || (name_response.lost_focus() && draft.name_dirty);
+                                if name_commit && draft.name_dirty {
+                                    let trimmed = draft.name.trim().to_owned();
+                                    if trimmed.is_empty() {
+                                        draft.error = Some("Name can\u{2019}t be empty.".to_owned());
+                                        draft.name = draft.original_name.clone();
+                                    } else if trimmed == draft.original_name {
+                                        // No-op commit.
+                                    } else {
+                                        event = Some(ManageThemesEvent::Rename {
+                                            theme_id: draft.id,
+                                            new_name: trimmed,
+                                        });
+                                    }
+                                    draft.name_dirty = false;
+                                }
+
+                                // Description field
+                                ui.add_space(4.0);
+                                let desc_response = ui.add(
+                                    egui::TextEdit::singleline(&mut draft.description)
+                                        .hint_text("(optional description)")
+                                        .desired_width(560.0),
+                                );
+                                if desc_response.changed() {
+                                    draft.description_dirty = true;
+                                }
+                                let desc_commit = (desc_response.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                                    || (desc_response.lost_focus() && draft.description_dirty);
+                                if desc_commit && draft.description_dirty {
+                                    let trimmed = draft.description.trim().to_owned();
+                                    if trimmed != draft.original_description {
+                                        event = Some(ManageThemesEvent::UpdateDesc {
+                                            theme_id: draft.id,
+                                            new_description: trimmed,
+                                        });
+                                    }
+                                    draft.description_dirty = false;
+                                }
+
+                                if let Some(ref err) = draft.error {
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new(format!("\u{26A0} {err}"))
+                                            .size(11.0)
+                                            .color(ALERT_EXTREME_FG),
+                                    );
+                                }
+                            });
+                        ui.add_space(8.0);
+                    }
+                });
+
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Close")
+                                        .size(13.0)
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .fill(SURFACE)
+                                .stroke(egui::Stroke::new(1.0, BORDER))
+                                .corner_radius(6.0),
+                            )
+                            .clicked()
+                        {
+                            event = Some(ManageThemesEvent::Close);
+                        }
+                    },
+                );
+            });
+        });
+
+    // Delete-confirm overlay — rendered on top of the main dialog so
+    // the user sees what they're about to destroy in context.
+    if let Some(theme_id) = delete_confirm {
+        let target = drafts.iter().find(|d| d.id == theme_id);
+        if let Some(target) = target {
+            let overlay_w = 420.0_f32.min(screen.width() * 0.75);
+            let overlay_h = 200.0_f32.min(screen.height() * 0.5);
+            egui::Window::new("Delete theme?")
+                .collapsible(false)
+                .resizable(false)
+                .fixed_size([overlay_w, overlay_h])
+                .default_pos([
+                    (screen.width() - overlay_w) / 2.0,
+                    (screen.height() - overlay_h) / 2.0,
+                ])
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Delete \u{201C}{}\u{201D}?",
+                            target.name
+                        ))
+                        .size(14.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                    );
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!(
+                                "Its {} model{} will be moved to Uncategorized.",
+                                target.count,
+                                if target.count == 1 { "" } else { "s" }
+                            ))
+                            .size(12.0)
+                            .color(TEXT_SECONDARY),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new("Cancel")
+                                        .size(13.0)
+                                        .color(TEXT_PRIMARY),
+                                )
+                                .fill(SURFACE)
+                                .stroke(egui::Stroke::new(1.0, BORDER))
+                                .corner_radius(6.0),
+                            )
+                            .clicked()
+                        {
+                            event = Some(ManageThemesEvent::DeleteCancel);
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("Delete")
+                                                .size(13.0)
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .fill(ALERT_EXTREME_FG)
+                                        .corner_radius(6.0),
+                                    )
+                                    .clicked()
+                                {
+                                    event = Some(ManageThemesEvent::DeleteConfirm(theme_id));
+                                }
+                            },
+                        );
+                    });
+                });
+        }
+    }
+
+    event
 }

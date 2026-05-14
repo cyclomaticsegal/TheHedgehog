@@ -1,8 +1,11 @@
 mod dialogs;
 mod inference_label;
+mod model_browser;
 mod sidebar;
 mod tasks;
 mod theme;
+mod theme_cards;
+mod theme_list;
 mod util;
 mod views;
 
@@ -12,9 +15,9 @@ use crate::eval;
 use crate::help;
 use crate::knowledge;
 use crate::models::{
-    AiPanelDock, AlertEvent, AlertLevel, ApiKeys, AppSettings, ChartWindow, Instrument,
-    LlmProvider, Observation, ParsedHypothesis, RefreshEvent, SavedInference, ThresholdConfig,
-    ThresholdSnapshot, VixStatus,
+    AiPanelDock, AlertEvent, AlertLevel, ApiKeys, AppSettings, ChartWindow, FoldsModelRecord,
+    Instrument, LlmProvider, Observation, ParsedHypothesis, RefreshEvent, SavedInference,
+    ThresholdConfig, ThresholdSnapshot, VixStatus,
 };
 use crate::providers;
 use crate::storage::Storage;
@@ -35,7 +38,7 @@ use tasks::{
 };
 use views::{
     CentralView, DriverDetailSection, LogEntry, LogStatus, ModelView, PricePickerAction, StatusKind,
-    format_log_status,
+    ThemeCardData, ThemeListSort, format_log_status,
 };
 use theme::*;
 use util::{
@@ -195,6 +198,51 @@ pub struct DashboardApp {
     /// Maps inference_id → (model_id, status) for showing 51Folds badges
     /// in the history list and report window.
     folds_status_by_inference: std::collections::HashMap<i64, (String, String)>,
+    /// Model the user is currently *viewing* in the 51Folds browser
+    /// detail. Independent of `folds_task` — viewing is non-destructive
+    /// and never touches an in-flight foreground build. Stored swapped
+    /// out of `folds_task` only for the duration of the central-panel
+    /// render (see `in_viewed_render`).
+    viewed_task: Option<FoldsTask>,
+    /// True while `render_central_model_view` has temporarily swapped
+    /// `viewed_task` into `folds_task` so existing detail code paths can
+    /// render against it. Used to gate foreground-mutating affordances
+    /// (Refresh-from-51Folds, Re-evaluate) so they cannot accidentally
+    /// fire against a model the user is only browsing.
+    in_viewed_render: bool,
+    /// Pre-aggregated theme cards for the cards landing (theme + count +
+    /// up to two sample question previews). Refreshed via TTL.
+    cached_theme_cards: Vec<ThemeCardData>,
+    /// When `cached_theme_cards` was last refreshed. `None` forces a
+    /// load on the next render of the browser.
+    themes_loaded_at: Option<std::time::Instant>,
+    /// Currently-open theme's id, valid only while `model_view` is
+    /// `ModelView::ThemeList(id)`. Used to refresh the row cache when
+    /// the theme changes.
+    theme_list_theme_id: Option<i64>,
+    /// 0-indexed page within the open theme.
+    theme_list_page: usize,
+    /// Active sort for the open theme's list.
+    theme_list_sort: ThemeListSort,
+    /// Cached models for the currently-open theme, already sorted
+    /// per `theme_list_sort`.
+    cached_theme_models: Vec<FoldsModelRecord>,
+    /// The theme the user has picked (or just created) for the model
+    /// about to be submitted. `None` means "fall back to Uncategorized."
+    /// Cleared after `start_folds_create` consumes it.
+    pending_theme: Option<i64>,
+    /// Inline state for the "Create new theme" affordance in the
+    /// picker. When `Some`, an `egui::TextEdit` is shown next to the
+    /// dropdown; on commit it inserts a row into `folds_themes` and
+    /// sets `pending_theme` to the new id.
+    new_theme_draft: Option<String>,
+    /// True while the Manage Themes dialog is open.
+    manage_themes_open: bool,
+    /// Editable copies of the themes shown inside the dialog.
+    manage_themes_drafts: Vec<views::ThemeDraft>,
+    /// `Some(theme_id)` while the delete-confirm overlay is showing
+    /// for one row of the Manage Themes dialog.
+    manage_themes_delete_confirm: Option<i64>,
     // -- DAG visualization --------------------------------------------------
     /// Stored raw window handle from CreationContext for wry child webview.
     stored_window_handle: Option<crate::dag::StoredWindowHandle>,
@@ -430,6 +478,43 @@ fn is_checker_pixel(r: u8, g: u8, b: u8) -> bool {
     (max_c - min_c) < 30
 }
 
+/// Sort the per-theme model rows in place per the chosen list sort.
+/// Storage returns rows in `created_at DESC` order, which is also the
+/// default; the other variants are deterministic re-orderings of that
+/// same slice.
+fn apply_sort(rows: &mut [FoldsModelRecord], sort: ThemeListSort) {
+    use crate::models::{FOLDS_STATUS_FAIL, FOLDS_STATUS_SUCCESS, FOLDS_STATUS_UNDISCLOSED_FAILURE};
+    match sort {
+        ThemeListSort::NewestFirst => {
+            rows.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        }
+        ThemeListSort::OldestFirst => {
+            rows.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        }
+        ThemeListSort::BuiltFirst => {
+            rows.sort_by(|a, b| {
+                let a_built = (a.status == FOLDS_STATUS_SUCCESS) as i32;
+                let b_built = (b.status == FOLDS_STATUS_SUCCESS) as i32;
+                b_built
+                    .cmp(&a_built)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            });
+        }
+        ThemeListSort::FailedFirst => {
+            let is_failed = |s: &str| {
+                s == FOLDS_STATUS_FAIL || s == FOLDS_STATUS_UNDISCLOSED_FAILURE
+            };
+            rows.sort_by(|a, b| {
+                let a_failed = is_failed(&a.status) as i32;
+                let b_failed = is_failed(&b.status) as i32;
+                b_failed
+                    .cmp(&a_failed)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            });
+        }
+    }
+}
+
 impl DashboardApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // Capture the native window handle for the wry DAG webview.
@@ -603,8 +688,8 @@ impl DashboardApp {
             last_selected_report_id: None,
             report_selection: HashSet::new(),
             view_back_target: None,
-            central_view: CentralView::Charts,
-            model_view: ModelView::Outcome,
+            central_view: CentralView::Model,
+            model_view: ModelView::Browse,
             model_view_back: ModelView::DriverList,
             parsed_hypothesis: None,
             draft_hypothesis: None,
@@ -622,6 +707,19 @@ impl DashboardApp {
             last_analysis_secondary: Vec::new(),
             last_bias_failures: Vec::new(),
             folds_status_by_inference: std::collections::HashMap::new(),
+            viewed_task: None,
+            in_viewed_render: false,
+            cached_theme_cards: Vec::new(),
+            themes_loaded_at: None,
+            theme_list_theme_id: None,
+            theme_list_page: 0,
+            theme_list_sort: ThemeListSort::default(),
+            cached_theme_models: Vec::new(),
+            pending_theme: None,
+            new_theme_draft: None,
+            manage_themes_open: false,
+            manage_themes_drafts: Vec::new(),
+            manage_themes_delete_confirm: None,
             stored_window_handle: stored_wh,
             dag_webview: crate::dag::DagWebView::new(),
             dag_model_generation: 0,
@@ -1707,6 +1805,7 @@ latest close. Keep SECONDARY instruments as corroborative mentions only.\n",
 
         let db_path = database_path();
         let inference_id = self.last_inference_id;
+        let theme_id = self.pending_theme;
         let created_at = chrono::Utc::now();
         let question_label = draft.question.clone();
 
@@ -1726,12 +1825,24 @@ latest close. Keep SECONDARY instruments as corroborative mentions only.\n",
         self.folds_task.started_at = Some(created_at);
         self.folds_task.inference_id = inference_id;
 
+        // Consumed by the background thread below; reset so a quick
+        // second Create defaults to Uncategorized rather than silently
+        // reusing the previous theme.
+        self.pending_theme = None;
+        // Also drop any half-typed "Create new theme" string so the
+        // editor reopens cleanly next time.
+        self.new_theme_draft = None;
+        // Cards landing is now stale (count for the picked theme just
+        // went up by one).
+        self.themes_loaded_at = None;
+
         thread::spawn(move || {
             crate::folds::create_and_poll(
                 api_key,
                 req,
                 db_path,
                 inference_id,
+                theme_id,
                 created_at,
                 tx,
             );
@@ -2985,6 +3096,14 @@ confirming/contradicting signals, and why this 7-90 day timeframe matters.",
         });
         ui.add_space(8.0);
 
+        // Theme picker — pick which group this model belongs to before
+        // submitting. Refreshes the theme cache opportunistically so the
+        // dropdown is populated even on a session that hasn't visited
+        // the cards landing yet.
+        self.refresh_theme_cards_if_stale();
+        self.render_theme_picker(ui);
+        ui.add_space(8.0);
+
         let mut reroll_clicked = false;
         let mut create_clicked = false;
         ui.horizontal(|ui| {
@@ -3974,7 +4093,475 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         ui.add_space(4.0);
     }
 
+    /// Reload the cached model list from storage if it's been more than
+    /// Open the Manage Themes modal, snapshotting the current theme
+    /// list into editable drafts. Always refreshes the cache first so
+    /// the snapshot reflects DB state (the user may have created a
+    /// theme via the picker since the last cards-landing render).
+    fn open_manage_themes_dialog(&mut self) {
+        self.themes_loaded_at = None;
+        self.refresh_theme_cards_if_stale();
+        self.manage_themes_drafts = self
+            .cached_theme_cards
+            .iter()
+            .map(|c| views::ThemeDraft {
+                id: c.theme.id,
+                name: c.theme.name.clone(),
+                description: c.theme.description.clone(),
+                count: c.count,
+                error: None,
+                name_dirty: false,
+                description_dirty: false,
+                original_name: c.theme.name.clone(),
+                original_description: c.theme.description.clone(),
+                locked: c.theme.name == "Uncategorized",
+            })
+            .collect();
+        self.manage_themes_delete_confirm = None;
+        self.manage_themes_open = true;
+    }
+
+    fn handle_manage_themes_event(&mut self, event: views::ManageThemesEvent) {
+        use views::ManageThemesEvent;
+        match event {
+            ManageThemesEvent::Close => {
+                self.manage_themes_open = false;
+                self.manage_themes_drafts.clear();
+                self.manage_themes_delete_confirm = None;
+                // Force the cards landing to re-render with latest data.
+                self.themes_loaded_at = None;
+            }
+            ManageThemesEvent::Rename {
+                theme_id,
+                new_name,
+            } => {
+                match self.storage.rename_theme(theme_id, &new_name) {
+                    Ok(()) => {
+                        // Reflect the commit in the local draft so the
+                        // field stops appearing "dirty" and reverts
+                        // would land on the new name, not the old one.
+                        if let Some(d) = self
+                            .manage_themes_drafts
+                            .iter_mut()
+                            .find(|d| d.id == theme_id)
+                        {
+                            d.name = new_name.clone();
+                            d.original_name = new_name;
+                            d.error = None;
+                        }
+                        self.themes_loaded_at = None;
+                    }
+                    Err(e) => {
+                        if let Some(d) = self
+                            .manage_themes_drafts
+                            .iter_mut()
+                            .find(|d| d.id == theme_id)
+                        {
+                            d.name = d.original_name.clone();
+                            d.error = Some(format!(
+                                "Couldn\u{2019}t rename: {e}. Possibly a duplicate name."
+                            ));
+                        }
+                    }
+                }
+            }
+            ManageThemesEvent::UpdateDesc {
+                theme_id,
+                new_description,
+            } => {
+                match self
+                    .storage
+                    .update_theme_description(theme_id, &new_description)
+                {
+                    Ok(()) => {
+                        if let Some(d) = self
+                            .manage_themes_drafts
+                            .iter_mut()
+                            .find(|d| d.id == theme_id)
+                        {
+                            d.description = new_description.clone();
+                            d.original_description = new_description;
+                            d.error = None;
+                        }
+                        self.themes_loaded_at = None;
+                    }
+                    Err(e) => {
+                        if let Some(d) = self
+                            .manage_themes_drafts
+                            .iter_mut()
+                            .find(|d| d.id == theme_id)
+                        {
+                            d.description = d.original_description.clone();
+                            d.error = Some(format!("Couldn\u{2019}t update description: {e}"));
+                        }
+                    }
+                }
+            }
+            ManageThemesEvent::DeleteRequest(theme_id) => {
+                self.manage_themes_delete_confirm = Some(theme_id);
+            }
+            ManageThemesEvent::DeleteConfirm(theme_id) => {
+                match self
+                    .storage
+                    .delete_theme_reassigning_to_uncategorized(theme_id)
+                {
+                    Ok(_moved) => {
+                        self.manage_themes_drafts.retain(|d| d.id != theme_id);
+                        self.manage_themes_delete_confirm = None;
+                        self.themes_loaded_at = None;
+                        // Refresh the count on the Uncategorized row so
+                        // the dialog reflects the move immediately.
+                        self.refresh_theme_cards_if_stale();
+                        for d in self.manage_themes_drafts.iter_mut() {
+                            if let Some(card) = self
+                                .cached_theme_cards
+                                .iter()
+                                .find(|c| c.theme.id == d.id)
+                            {
+                                d.count = card.count;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.manage_themes_delete_confirm = None;
+                        self.set_status(
+                            &format!("Couldn\u{2019}t delete theme: {e}"),
+                            StatusKind::Error,
+                        );
+                    }
+                }
+            }
+            ManageThemesEvent::DeleteCancel => {
+                self.manage_themes_delete_confirm = None;
+            }
+        }
+    }
+
+    /// Render the theme picker shown above the "Create 51Folds Model"
+    /// button. Lets the user pick an existing theme or type a new
+    /// name; either way it sets `self.pending_theme` for the next
+    /// `start_folds_create` call to consume.
+    fn render_theme_picker(&mut self, ui: &mut egui::Ui) {
+        // Default the pending theme to Uncategorized so the picker
+        // always has a sensible starting selection.
+        let uncategorized_id = self
+            .cached_theme_cards
+            .iter()
+            .find(|c| c.theme.name == "Uncategorized")
+            .map(|c| c.theme.id);
+        if self.pending_theme.is_none() {
+            self.pending_theme = uncategorized_id;
+        }
+
+        ui.label(
+            RichText::new("Theme")
+                .size(12.0)
+                .strong()
+                .color(TEXT_PRIMARY),
+        );
+        ui.label(
+            RichText::new(
+                "Group this model with related ones on the 51Folds cards landing.",
+            )
+            .size(11.0)
+            .color(TEXT_SECONDARY),
+        );
+
+        let current_label = self
+            .pending_theme
+            .and_then(|id| {
+                self.cached_theme_cards
+                    .iter()
+                    .find(|c| c.theme.id == id)
+                    .map(|c| c.theme.name.clone())
+            })
+            .unwrap_or_else(|| "Uncategorized".to_owned());
+
+        let mut new_selection: Option<i64> = None;
+        let mut open_new_theme = false;
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("theme_picker_dropdown")
+                .selected_text(&current_label)
+                .show_ui(ui, |ui| {
+                    for card in &self.cached_theme_cards {
+                        let selected = self.pending_theme == Some(card.theme.id);
+                        let label = format!("{} ({})", card.theme.name, card.count);
+                        if ui.selectable_label(selected, label).clicked() {
+                            new_selection = Some(card.theme.id);
+                        }
+                    }
+                    ui.separator();
+                    if ui.selectable_label(false, "\u{FF0B} Create new theme\u{2026}").clicked() {
+                        open_new_theme = true;
+                    }
+                });
+
+            if open_new_theme && self.new_theme_draft.is_none() {
+                self.new_theme_draft = Some(String::new());
+            }
+
+            if let Some(ref mut draft_name) = self.new_theme_draft {
+                let response = ui.add(
+                    egui::TextEdit::singleline(draft_name)
+                        .hint_text("New theme name")
+                        .desired_width(180.0),
+                );
+                let commit = response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let add_clicked = ui.button("Add").clicked();
+                let cancel_clicked = ui.button("Cancel").clicked();
+                if commit || add_clicked {
+                    let name = draft_name.trim().to_owned();
+                    if !name.is_empty() {
+                        match self.storage.insert_theme(&name, "") {
+                            Ok(id) => {
+                                new_selection = Some(id);
+                                self.new_theme_draft = None;
+                                // Force the cards cache to reload so
+                                // the dropdown sees the new theme on
+                                // the next frame.
+                                self.themes_loaded_at = None;
+                            }
+                            Err(e) => {
+                                self.set_status(
+                                    &format!("Couldn't create theme \"{name}\": {e}"),
+                                    StatusKind::Error,
+                                );
+                            }
+                        }
+                    }
+                }
+                if cancel_clicked {
+                    self.new_theme_draft = None;
+                }
+            }
+        });
+
+        if let Some(id) = new_selection {
+            self.pending_theme = Some(id);
+        }
+    }
+
+    /// Reload `cached_theme_cards` from storage if it's been more than
+    /// 30 seconds since the last refresh (or has never been loaded).
+    /// Callers that want a guaranteed-fresh view (e.g. after a model
+    /// completes or a theme is renamed) should clear `themes_loaded_at`
+    /// first to force the next call to repopulate.
+    fn refresh_theme_cards_if_stale(&mut self) {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        let stale = self
+            .themes_loaded_at
+            .map(|t| t.elapsed() >= TTL)
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        let themes = match self.storage.load_themes_with_counts() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("warn: failed to reload theme list: {e:#}");
+                return;
+            }
+        };
+        let mut cards: Vec<ThemeCardData> = Vec::with_capacity(themes.len());
+        for (theme, count) in themes {
+            let sample_questions = self
+                .storage
+                .load_theme_sample_questions(theme.id)
+                .unwrap_or_default();
+            cards.push(ThemeCardData {
+                theme,
+                count,
+                sample_questions,
+            });
+        }
+        self.cached_theme_cards = cards;
+        self.themes_loaded_at = Some(std::time::Instant::now());
+    }
+
+    /// Refresh the row cache for `theme_list_theme_id`. Called when the
+    /// user enters a theme list, changes sort, or after any model
+    /// completes (cache is keyed off the open theme so a no-op for
+    /// other themes).
+    fn refresh_theme_models(&mut self) {
+        let Some(theme_id) = self.theme_list_theme_id else {
+            self.cached_theme_models.clear();
+            return;
+        };
+        let mut rows = match self.storage.load_models_in_theme(theme_id) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("warn: failed to load theme models: {e:#}");
+                Vec::new()
+            }
+        };
+        apply_sort(&mut rows, self.theme_list_sort);
+        self.cached_theme_models = rows;
+    }
+
+    fn handle_theme_cards_action(&mut self, action: theme_cards::ThemeCardsAction) {
+        match action {
+            theme_cards::ThemeCardsAction::None => {}
+            theme_cards::ThemeCardsAction::OpenTheme(theme_id) => {
+                self.theme_list_theme_id = Some(theme_id);
+                self.theme_list_page = 0;
+                self.theme_list_sort = ThemeListSort::default();
+                self.refresh_theme_models();
+                self.model_view = ModelView::ThemeList(theme_id);
+            }
+            theme_cards::ThemeCardsAction::OpenManage => {
+                self.open_manage_themes_dialog();
+            }
+        }
+    }
+
+    fn handle_theme_list_action(&mut self, action: theme_list::ThemeListAction) {
+        match action {
+            theme_list::ThemeListAction::None => {}
+            theme_list::ThemeListAction::Back => {
+                self.theme_list_theme_id = None;
+                self.cached_theme_models.clear();
+                self.theme_list_page = 0;
+                self.model_view = ModelView::Browse;
+            }
+            theme_list::ThemeListAction::OpenModel(model_id) => {
+                self.open_browser_model(&model_id);
+            }
+            theme_list::ThemeListAction::ChangeSort(sort) => {
+                self.theme_list_sort = sort;
+                self.theme_list_page = 0;
+                apply_sort(&mut self.cached_theme_models, sort);
+            }
+            theme_list::ThemeListAction::ChangePage(page) => {
+                self.theme_list_page = page;
+            }
+        }
+    }
+
+    /// Load a 51Folds model's stored response into `viewed_task` without
+    /// disturbing `folds_task` (which may hold a live foreground build).
+    /// Navigates to the Outcome sub-view so the user immediately sees
+    /// the model's probability bars.
+    fn open_browser_model(&mut self, model_id: &str) {
+        let json = match self.storage.load_folds_response_by_model_id(model_id) {
+            Ok(Some(json)) => json,
+            Ok(None) => {
+                self.set_status(
+                    &format!(
+                        "Model {model_id} has no stored response yet \u{2014} it may still be building."
+                    ),
+                    StatusKind::Info,
+                );
+                return;
+            }
+            Err(e) => {
+                self.set_status(
+                    &format!("Failed to load model {model_id}: {e}"),
+                    StatusKind::Error,
+                );
+                return;
+            }
+        };
+        let model: fiftyone_folds::ModelResponse = match serde_json::from_str(&json) {
+            Ok(m) => m,
+            Err(e) => {
+                self.set_status(
+                    &format!("Stored response for model {model_id} is malformed: {e}"),
+                    StatusKind::Error,
+                );
+                return;
+            }
+        };
+        let question = if model.question.trim().is_empty() {
+            None
+        } else {
+            Some(model.question.clone())
+        };
+        let mut task = FoldsTask::new();
+        task.model_id = Some(model_id.to_owned());
+        task.model = Some(Box::new(model));
+        task.question = question;
+        task.init_draft_drivers();
+        self.viewed_task = Some(task);
+        self.model_view = ModelView::Outcome;
+    }
+
     fn render_central_model_view(&mut self, ui: &mut egui::Ui) {
+        // Cards landing — the registry view.
+        if self.model_view == ModelView::Browse {
+            self.refresh_theme_cards_if_stale();
+            let action = theme_cards::render_theme_cards(ui, &self.cached_theme_cards);
+            self.handle_theme_cards_action(action);
+            return;
+        }
+        // Per-theme paginated list.
+        if let ModelView::ThemeList(theme_id) = self.model_view {
+            // Defensive: keep the cache aligned if the user navigated
+            // here via a deep link / state shuffle that bypassed
+            // `handle_theme_cards_action`.
+            if self.theme_list_theme_id != Some(theme_id) {
+                self.theme_list_theme_id = Some(theme_id);
+                self.theme_list_page = 0;
+                self.refresh_theme_models();
+            }
+            let theme_opt = self
+                .cached_theme_cards
+                .iter()
+                .find(|c| c.theme.id == theme_id)
+                .map(|c| c.theme.clone());
+            if let Some(theme) = theme_opt {
+                let foreground_id = self.folds_task.model_id.clone();
+                let action = theme_list::render_theme_list(
+                    ui,
+                    &theme,
+                    &self.cached_theme_models,
+                    foreground_id.as_deref(),
+                    self.theme_list_sort,
+                    self.theme_list_page,
+                );
+                self.handle_theme_list_action(action);
+            } else {
+                // Theme rows haven't been cached yet (cold start path);
+                // refresh and let the next frame render normally.
+                self.refresh_theme_cards_if_stale();
+            }
+            return;
+        }
+
+        // If the user is viewing a non-foreground model via the browser,
+        // swap it into `folds_task` for the duration of this render so
+        // every existing code path that reads from `folds_task` (and the
+        // many small mutations like driver-pill state changes) just
+        // works. Foreground build state — including any in-flight rx
+        // channels — is preserved and restored at the end. Gating flags
+        // on `in_viewed_render` hide the foreground-mutating actions
+        // (Refresh-from-server, Re-evaluate) so the user cannot
+        // accidentally fire them against a browsed model.
+        let viewing = self.viewed_task.is_some();
+        if viewing {
+            let viewed = self.viewed_task.take().expect("checked Some above");
+            let real_foreground = std::mem::replace(&mut self.folds_task, viewed);
+            self.viewed_task = Some(real_foreground);
+            self.in_viewed_render = true;
+        }
+
+        self.render_central_model_view_inner(ui);
+
+        if viewing {
+            // Restore foreground; whatever the user mutated in the
+            // viewed model (driver pills, etc.) goes back into
+            // `viewed_task` so subsequent frames continue the same view.
+            let original_foreground = self
+                .viewed_task
+                .take()
+                .expect("swap above guarantees Some");
+            let mutated_view = std::mem::replace(&mut self.folds_task, original_foreground);
+            self.viewed_task = Some(mutated_view);
+            self.in_viewed_render = false;
+        }
+    }
+
+    fn render_central_model_view_inner(&mut self, ui: &mut egui::Ui) {
         self.render_back_pill(ui);
         if !self.folds_task.is_complete() {
             // ── Build in progress — show spinner + model ID ───────
@@ -4197,6 +4784,14 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.in_viewed_render {
+                    ui.label(
+                        RichText::new("Browsing \u{2014} not the foreground build")
+                            .size(11.0)
+                            .color(TEXT_MUTED),
+                    );
+                    return;
+                }
                 let label = if self.folds_task.refresh_in_flight {
                     "Refreshing…"
                 } else {
@@ -4260,7 +4855,14 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                         ModelView::DriverSection(idx, section) => {
                             self.render_driver_section_page(ui, idx, section);
                         }
-                        ModelView::VisualMap => {} // handled above
+                        // All three handled in the outer dispatcher
+                        // (`render_central_model_view`); the short-
+                        // circuits at the top make these unreachable
+                        // in practice, but the arm is kept explicit
+                        // so the enum match stays exhaustive.
+                        ModelView::Browse
+                        | ModelView::ThemeList(_)
+                        | ModelView::VisualMap => {}
                     }
                 });
         }
@@ -4704,8 +5306,13 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         // stays in its "working" visual regardless of any_modified, so
         // the user cannot edit pills back to un-modify it and make the
         // button appear to "deactivate" while work is still happening.
+        // When rendering a browsed (non-foreground) model, Re-evaluate
+        // is disabled — it would fire a 51Folds API call against the
+        // currently-swapped-in viewed model rather than the foreground
+        // build the user expects to be acting on. Reset stays enabled
+        // because it's a purely local pill-state rollback.
         let reset_enabled = any_modified && !reevaluating;
-        let reeval_enabled = any_modified && !reevaluating;
+        let reeval_enabled = any_modified && !reevaluating && !self.in_viewed_render;
         // Revert-to-original is always available when a model is
         // loaded and no re-eval is currently running. It doesn't
         // require pending pill edits — it's a full "go back to the
@@ -5785,6 +6392,19 @@ impl eframe::App for DashboardApp {
 
 impl DashboardApp {
     fn show_dashboard(&mut self, ctx: &egui::Context) {
+        // -- Manage Themes dialog --
+        if self.manage_themes_open {
+            let confirm = self.manage_themes_delete_confirm;
+            let event = dialogs::render_manage_themes_dialog(
+                ctx,
+                &mut self.manage_themes_drafts,
+                confirm,
+            );
+            if let Some(event) = event {
+                self.handle_manage_themes_event(event);
+            }
+        }
+
         // -- [P] price-picker / price-panel toggle --
         let text_focused = ctx.memory(|m| m.focused().is_some());
         if !text_focused && ctx.input(|i| i.key_pressed(egui::Key::P)) {
@@ -5806,13 +6426,9 @@ impl DashboardApp {
         egui::TopBottomPanel::top("rs_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 // Central view tabs — explicit navigation clears any
-                // pending back-pill target.
-                if ui
-                    .selectable_value(&mut self.central_view, CentralView::Charts, "VIX charts")
-                    .clicked()
-                {
-                    self.view_back_target = None;
-                }
+                // pending back-pill target. Order: 51Folds (registry) →
+                // Research Agent (deep on-ramp) → VIX charts (visual
+                // on-ramp). Reflects the app's stated identity.
                 let model_label = if self.folds_task.is_complete() {
                     RichText::new("51Folds").color(Color32::from_rgb(59, 130, 246))
                 } else {
@@ -5834,6 +6450,12 @@ impl DashboardApp {
                         CentralView::ResearchAgent,
                         "Research Agent",
                     )
+                    .clicked()
+                {
+                    self.view_back_target = None;
+                }
+                if ui
+                    .selectable_value(&mut self.central_view, CentralView::Charts, "VIX charts")
                     .clicked()
                 {
                     self.view_back_target = None;
@@ -5871,9 +6493,56 @@ impl DashboardApp {
                 // Model navigation (only when 51Folds tab is active)
                 let mut trigger_obsidian = false;
                 if self.central_view == CentralView::Model {
-                    ui.selectable_value(&mut self.model_view, ModelView::Outcome, "Outcome");
-                    ui.selectable_value(&mut self.model_view, ModelView::DriverList, "Drivers");
-                    ui.selectable_value(&mut self.model_view, ModelView::VisualMap, "Visual Map");
+                    // Themes pill — always returns to the cards landing.
+                    if ui
+                        .selectable_label(self.model_view == ModelView::Browse, "Themes")
+                        .on_hover_text("Back to the 51Folds cards landing.")
+                        .clicked()
+                    {
+                        self.viewed_task = None;
+                        self.theme_list_theme_id = None;
+                        self.cached_theme_models.clear();
+                        self.model_view = ModelView::Browse;
+                    }
+                    // Theme-list back affordance: when the user is in
+                    // detail and came via a theme list, give them a
+                    // one-click hop back to that list.
+                    if let Some(theme_id) = self.theme_list_theme_id {
+                        let in_detail = !matches!(
+                            self.model_view,
+                            ModelView::Browse | ModelView::ThemeList(_)
+                        );
+                        if in_detail {
+                            let theme_name = self
+                                .cached_theme_cards
+                                .iter()
+                                .find(|c| c.theme.id == theme_id)
+                                .map(|c| c.theme.name.clone())
+                                .unwrap_or_else(|| "Theme".to_owned());
+                            if ui
+                                .selectable_label(false, format!("\u{2190} {theme_name}"))
+                                .on_hover_text("Back to this theme's model list.")
+                                .clicked()
+                            {
+                                self.viewed_task = None;
+                                self.model_view = ModelView::ThemeList(theme_id);
+                            }
+                        }
+                    }
+                    // Detail sub-pills are only meaningful once a model
+                    // is actually being viewed (either browsed via
+                    // viewed_task, or foreground via folds_task.model).
+                    let in_detail = !matches!(
+                        self.model_view,
+                        ModelView::Browse | ModelView::ThemeList(_)
+                    );
+                    let detail_available =
+                        self.viewed_task.is_some() || self.folds_task.model.is_some();
+                    if in_detail && detail_available {
+                        ui.selectable_value(&mut self.model_view, ModelView::Outcome, "Outcome");
+                        ui.selectable_value(&mut self.model_view, ModelView::DriverList, "Drivers");
+                        ui.selectable_value(&mut self.model_view, ModelView::VisualMap, "Visual Map");
+                    }
 
                     // Obsidian export: live alongside the Visual Map tab
                     // since both are "model viewers". Only enabled once a
@@ -6080,20 +6749,28 @@ impl DashboardApp {
             .default_width(240.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(status) = &self.cached_vix_status {
-                        sidebar_vix_summary(ui, status);
+                    // Chart-context sidebar widgets only appear on the
+                    // Charts tab — they have no meaning when the user is
+                    // browsing the model registry, doing research, or
+                    // reading reports. The config block below (Data
+                    // Source / AI / Research / Thresholds / 51Folds key)
+                    // stays cross-cutting and is always visible.
+                    if self.central_view == CentralView::Charts {
+                        if let Some(status) = &self.cached_vix_status {
+                            sidebar_vix_summary(ui, status);
+                            ui.separator();
+                        }
+
+                        sidebar_overlay_controls(ui, &mut self.settings);
+                        ui.separator();
+
+                        sidebar_spike_episodes(
+                            ui,
+                            &self.cached_spike_episodes,
+                            &mut self.highlighted_spike,
+                        );
                         ui.separator();
                     }
-
-                    sidebar_overlay_controls(ui, &mut self.settings);
-                    ui.separator();
-
-                    sidebar_spike_episodes(
-                        ui,
-                        &self.cached_spike_episodes,
-                        &mut self.highlighted_spike,
-                    );
-                    ui.separator();
 
                     let keys_empty = self.api_keys.all_empty();
                     egui::CollapsingHeader::new("Data Source")

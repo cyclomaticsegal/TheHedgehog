@@ -82,6 +82,7 @@ pub fn create_and_poll(
     req: FoldsCreateRequest,
     db_path: PathBuf,
     inference_id: Option<i64>,
+    theme_id: Option<i64>,
     created_at: DateTime<Utc>,
     tx: Sender<FoldsResult>,
 ) {
@@ -133,8 +134,11 @@ pub fn create_and_poll(
         );
 
         // Persist pending row BEFORE polling so resume sweep can pick up
-        // if the app closes mid-build.
+        // if the app closes mid-build. Also writes the theme assignment
+        // so the model shows up under the chosen card on the very next
+        // refresh of the cards landing.
         persist_pending_row(&db_path, &model_id, &req.question, inference_id, &created_at);
+        persist_theme_assignment(&db_path, &model_id, theme_id);
 
         let _ = tx.send(FoldsResult::Created(model_id.clone()));
 
@@ -661,6 +665,33 @@ fn persist_pending_row(
                 question,
                 inference_id,
             ],
+        );
+    }
+}
+
+/// Write the theme assignment for a freshly-created model. If
+/// `theme_id` is None, the model is filed under Uncategorized so the
+/// cards landing always shows full coverage of `folds_models`.
+fn persist_theme_assignment(db_path: &PathBuf, model_id: &str, theme_id: Option<i64>) {
+    let Ok(conn) = rusqlite::Connection::open(db_path) else { return };
+    let now = Utc::now().to_rfc3339();
+    let resolved_id: Option<i64> = match theme_id {
+        Some(id) => Some(id),
+        None => conn
+            .query_row(
+                "SELECT id FROM folds_themes WHERE name = 'Uncategorized'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok(),
+    };
+    if let Some(id) = resolved_id {
+        let _ = conn.execute(
+            r#"INSERT INTO folds_model_themes (model_id, theme_id, assigned_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(model_id) DO UPDATE
+                   SET theme_id = excluded.theme_id, assigned_at = excluded.assigned_at"#,
+            rusqlite::params![model_id, id, now],
         );
     }
 }
