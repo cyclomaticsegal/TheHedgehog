@@ -14,6 +14,7 @@ pub(super) fn render_row(
     ui: &mut egui::Ui,
     record: &FoldsModelRecord,
     is_foreground: bool,
+    has_vault: bool,
     row_height: f32,
 ) -> bool {
     let (status_label, status_color) = status_chip(record.status.as_str());
@@ -54,14 +55,27 @@ pub(super) fn render_row(
         Color32::WHITE,
     );
 
+    let mut next_pin_x = chip_rect.right() + 8.0;
     if is_foreground {
-        let pin_pos = egui::Pos2::new(chip_rect.right() + 8.0, chip_rect.center().y);
+        let pin_pos = egui::Pos2::new(next_pin_x, chip_rect.center().y);
+        let galley = ui.painter().layout_no_wrap(
+            "\u{1F4CC} Foreground".to_owned(),
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            ACCENT_BLUE,
+        );
+        let advance = galley.size().x;
+        ui.painter()
+            .galley(pin_pos - Vec2::new(0.0, galley.size().y / 2.0), galley, ACCENT_BLUE);
+        next_pin_x += advance + 10.0;
+    }
+    if has_vault {
+        let pin_pos = egui::Pos2::new(next_pin_x, chip_rect.center().y);
         ui.painter().text(
             pin_pos,
             egui::Align2::LEFT_CENTER,
-            "\u{1F4CC} Foreground",
+            "\u{1F4D2} Vault",
             egui::FontId::new(11.0, egui::FontFamily::Proportional),
-            ACCENT_BLUE,
+            ALERT_NORMAL_FG,
         );
     }
 

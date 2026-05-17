@@ -394,6 +394,294 @@ pub(super) fn render_apply_confirm_dialog(
     (cancel, confirm)
 }
 
+/// Render the Obsidian merge preview dialog. Shows the diff produced
+/// by [`crate::obsidian::merge::read_vault_diff`] with per-row
+/// checkboxes for driver state changes and a "pending SDK support"
+/// section listing the parked edit classes (notes, renames, edges).
+///
+/// `selected` is mutated as the user ticks/unticks rows — the caller
+/// keeps it on `MergeTask` so it survives a re-render. Returns
+/// `(cancelled, apply_clicked)`.
+pub(super) fn render_merge_preview_dialog(
+    ctx: &egui::Context,
+    diff: &crate::obsidian::merge::VaultDiff,
+    selected: &mut std::collections::BTreeSet<String>,
+) -> (bool, bool) {
+    let screen = ctx.screen_rect();
+    let win_w = 580.0_f32.min(screen.width() * 0.9);
+    let win_h = 560.0_f32.min(screen.height() * 0.85);
+    let mut cancel = false;
+    let mut apply = false;
+    egui::Window::new("Merge from Vault")
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size([win_w, win_h])
+        .default_pos([
+            (screen.width() - win_w) / 2.0,
+            (screen.height() - win_h) / 2.0,
+        ])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(format!("Merge changes into {}", diff.model_id))
+                    .size(16.0)
+                    .strong()
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!(
+                    "Vault: {} · next snapshot: v{:03}",
+                    diff.vault_path.display(),
+                    diff.next_version()
+                ))
+                .size(11.0)
+                .color(TEXT_MUTED),
+            );
+            ui.add_space(12.0);
+
+            // Section 1 — driver state changes the user can apply.
+            ui.label(
+                RichText::new("Will be applied — driver state changes")
+                    .size(13.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.add_space(6.0);
+            egui::Frame::default()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("merge_dialog_state_changes")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            if diff.driver_state_changes.is_empty() {
+                                ui.label(
+                                    RichText::new(
+                                        "No driver state changes detected — only parked edits below.",
+                                    )
+                                    .size(12.0)
+                                    .italics()
+                                    .color(TEXT_MUTED),
+                                );
+                                return;
+                            }
+                            for c in &diff.driver_state_changes {
+                                let mut checked = selected.contains(&c.code);
+                                let row = format!(
+                                    "{}  {} → {}",
+                                    if c.name.is_empty() {
+                                        c.code.clone()
+                                    } else {
+                                        format!("{} ({})", c.name, c.code)
+                                    },
+                                    c.old_state,
+                                    c.new_state
+                                );
+                                if ui.checkbox(&mut checked, row).changed() {
+                                    if checked {
+                                        selected.insert(c.code.clone());
+                                    } else {
+                                        selected.remove(&c.code);
+                                    }
+                                }
+                                ui.add_space(2.0);
+                            }
+                        });
+                });
+
+            ui.add_space(14.0);
+
+            // Section 2 — detected but parked.
+            ui.label(
+                RichText::new("Detected, not applied (pending SDK support)")
+                    .size(13.0)
+                    .strong()
+                    .color(TEXT_PRIMARY),
+            );
+            ui.add_space(6.0);
+            egui::Frame::default()
+                .fill(SURFACE)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("merge_dialog_parked")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            let note_examples: Vec<String> = diff
+                                .note_additions
+                                .iter()
+                                .map(|n| {
+                                    let who = if n.driver_name.is_empty() {
+                                        n.driver_code.clone()
+                                    } else {
+                                        format!("{} ({})", n.driver_name, n.driver_code)
+                                    };
+                                    let first_line =
+                                        n.text.lines().next().unwrap_or("").trim();
+                                    let snippet = first_line.chars().take(80).collect::<String>();
+                                    if first_line.chars().count() > 80 {
+                                        format!("{who} — “{snippet}…”")
+                                    } else {
+                                        format!("{who} — “{snippet}”")
+                                    }
+                                })
+                                .collect();
+                            parked_section(
+                                ui,
+                                "Note additions",
+                                diff.note_additions.len(),
+                                "Pending Q1 — `submit_evidence()` semantics undocumented",
+                                &note_examples,
+                            );
+                            let meta_examples: Vec<String> = diff
+                                .driver_metadata_changes
+                                .iter()
+                                .map(|m| {
+                                    let field = match m.field {
+                                        crate::obsidian::merge::MetadataField::Name => "name",
+                                    };
+                                    format!("{} — {field}: “{}” → “{}”", m.code, m.old, m.new)
+                                })
+                                .collect();
+                            parked_section(
+                                ui,
+                                "Driver metadata edits (renames, descriptions)",
+                                diff.driver_metadata_changes.len(),
+                                "Pending Q2 — no metadata PATCH endpoint",
+                                &meta_examples,
+                            );
+                            let edge_examples: Vec<String> = diff
+                                .edge_changes
+                                .iter()
+                                .map(|e| format!("{} → {}", e.in_driver_code, e.target_link))
+                                .collect();
+                            parked_section(
+                                ui,
+                                "Edges (wiki-links inside `## Notes`)",
+                                diff.edge_changes.len(),
+                                "Pending Q3 — edges may be immutable post-build",
+                                &edge_examples,
+                            );
+                            if diff.total_parked() == 0 {
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new(
+                                        "None — every detectable edit class is either applied above or absent.",
+                                    )
+                                    .size(11.0)
+                                    .italics()
+                                    .color(TEXT_MUTED),
+                                );
+                            } else {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(
+                                        "These stay in the vault and will re-surface on the next merge until the matching SDK path lands.",
+                                    )
+                                    .size(11.0)
+                                    .italics()
+                                    .color(TEXT_MUTED),
+                                );
+                            }
+                        });
+                });
+
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().button_padding = Vec2::new(14.0, 8.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Cancel").size(13.0).color(TEXT_PRIMARY),
+                        )
+                        .fill(SURFACE)
+                        .stroke(Stroke::new(1.0, BORDER))
+                        .corner_radius(6.0),
+                    )
+                    .clicked()
+                {
+                    cancel = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let any_selected = !selected.is_empty();
+                    let btn = ui.add_enabled(
+                        any_selected,
+                        egui::Button::new(
+                            RichText::new(format!(
+                                "Apply {} state change{}",
+                                selected.len(),
+                                if selected.len() == 1 { "" } else { "s" }
+                            ))
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                        )
+                        .fill(ACCENT_BLUE_DIM)
+                        .corner_radius(6.0),
+                    );
+                    if btn.clicked() {
+                        apply = true;
+                    }
+                });
+            });
+        });
+    (cancel, apply)
+}
+
+fn parked_section(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: usize,
+    reason: &str,
+    examples: &[String],
+) {
+    let muted = count == 0;
+    let label_color = if muted { TEXT_MUTED } else { TEXT_PRIMARY };
+    let count_color = if muted { TEXT_MUTED } else { ALERT_EXTREME_FG };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(12.0).color(label_color));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                RichText::new(format!("× {count}"))
+                    .size(12.0)
+                    .monospace()
+                    .color(count_color),
+            );
+        });
+    });
+    if !reason.is_empty() {
+        ui.label(
+            RichText::new(format!("    {reason}"))
+                .size(10.5)
+                .italics()
+                .color(TEXT_MUTED),
+        );
+    }
+    // Show up to 3 concrete examples so the user can see what got
+    // detected even though it isn't being sent to the server.
+    for example in examples.iter().take(3) {
+        ui.label(
+            RichText::new(format!("    • {example}"))
+                .size(11.0)
+                .color(TEXT_SECONDARY),
+        );
+    }
+    if examples.len() > 3 {
+        ui.label(
+            RichText::new(format!("    + {} more…", examples.len() - 3))
+                .size(10.5)
+                .italics()
+                .color(TEXT_MUTED),
+        );
+    }
+    ui.add_space(4.0);
+}
+
 /// Render the "pick the primary instrument" modal shown when the user
 /// clicks Analyze with more than one overlay instrument selected.
 pub(super) fn render_analyze_primary_dialog(

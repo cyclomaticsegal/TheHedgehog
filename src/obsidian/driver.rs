@@ -7,6 +7,7 @@
 //! that link to the de-duplicated `Sources/` notes.
 
 use crate::obsidian::{
+    WriteMode, history,
     mermaid,
     names::Names,
     source::{SourceIndex, citation_key},
@@ -15,11 +16,26 @@ use anyhow::Result;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
+/// H2 headings emitted by this writer. Anything *not* in this set is
+/// treated as user-authored and preserved across selective re-exports.
+const KNOWN_MODEL_HEADINGS: &[&str] = &[
+    "Possible States",
+    "Why This Matters",
+    "How It Shifts",
+    "What To Monitor",
+    "Current State Rationale",
+    "History",
+    "Local Causal Map",
+    "In The Model",
+];
+
 pub(crate) fn write_all(
     model: &fiftyone_folds::ModelResponse,
     names: &Names,
     sources: &SourceIndex,
+    hist: &history::History,
     root: &Path,
+    mode: WriteMode,
 ) -> Result<()> {
     std::fs::create_dir_all(root.join("Drivers"))?;
 
@@ -29,6 +45,11 @@ pub(crate) fn write_all(
     let (parents_of, children_of) = adjacency(model);
 
     for d in &model.drivers {
+        let history_rows = hist
+            .drivers
+            .get(&d.code)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let body = render_driver(
             d,
             state_by_code.get(d.code.as_str()).copied(),
@@ -44,11 +65,35 @@ pub(crate) fn write_all(
             &by_code,
             names,
             sources,
+            history_rows,
         );
         let path = root.join(names.drivers.get(&d.code).expect("driver name precomputed"));
-        std::fs::write(&path, body)?;
+        let final_body = match mode {
+            WriteMode::Fresh => body,
+            WriteMode::Selective => merge_user_zones(&path, body)?,
+        };
+        std::fs::write(&path, final_body)?;
     }
     Ok(())
+}
+
+/// Reads an existing driver file (if any), extracts the user-authored
+/// H2 sections, and appends them after the fresh model-derived body.
+fn merge_user_zones(path: &Path, fresh_model_body: String) -> Result<String> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return Ok(fresh_model_body);
+    };
+    let preserved = history::extract_user_zones(&existing, KNOWN_MODEL_HEADINGS);
+    if preserved.trim().is_empty() {
+        return Ok(fresh_model_body);
+    }
+    let mut out = fresh_model_body;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&preserved);
+    Ok(out)
 }
 
 fn drivers_by_code(
@@ -116,6 +161,7 @@ fn render_driver(
     by_code: &BTreeMap<&str, &fiftyone_folds::Driver>,
     names: &Names,
     sources: &SourceIndex,
+    history_rows: &[history::DriverHistoryRow],
 ) -> String {
     let mut s = String::new();
     write_frontmatter(&mut s, driver, current_state, parents, children, names);
@@ -130,6 +176,7 @@ fn render_driver(
     if let Some(j) = justification {
         write_rationale(&mut s, &driver.code, j, sources);
     }
+    s.push_str(&history::render_driver_section(history_rows));
     write_local_map(&mut s, driver, parents, children, by_code);
     write_in_the_model(&mut s, parents, children, names);
 

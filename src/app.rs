@@ -33,24 +33,40 @@ use sidebar::{
     sidebar_vix_summary,
 };
 use tasks::{
-    FoldsBacklog, FoldsTask, LlmPoll, LlmTask, ObsidianEvent, ObsidianTask, ResearchTerminal,
-    SplashState, TrayRow,
+    FoldsBacklog, FoldsTask, LlmPoll, LlmTask, MergeEvent, MergeTask, ObsidianEvent, ObsidianTask,
+    ResearchTerminal, SplashState, TrayRow,
 };
+
+/// Internal error shape for `load_browser_model_payload` — keeps the
+/// vault-vs-DB fallback path readable without nesting `Result`s.
+enum BrowserModelError {
+    Pending,
+    Storage(String),
+    Malformed(String),
+}
+
+/// Outcome label → probability snapshot, paired with the same list at
+/// the prior vault snapshot. Used to seed the Outcome view's
+/// "↑ up from X%" delta annotation persistently across app restarts.
+type BrowserModelPayload = (
+    fiftyone_folds::ModelResponse,
+    Option<Vec<(String, f64)>>,
+);
 use views::{
     CentralView, DriverDetailSection, LogEntry, LogStatus, ModelView, PricePickerAction, StatusKind,
     ThemeCardData, ThemeListSort, format_log_status,
 };
 use theme::*;
 use util::{
-    database_path, filter_for_zoom, interpolate_at, map_val, open_in_obsidian,
-    reveal_in_file_manager, sh_single_quote, split_off_hypothesis, truncate_with_ellipsis,
-    update_env_content, validate_model_name,
+    apply_merge_blocking, database_path, filter_for_zoom, interpolate_at, map_val,
+    open_in_obsidian, reveal_in_file_manager, sh_single_quote, split_off_hypothesis,
+    truncate_with_ellipsis, update_env_content, validate_model_name,
 };
 use chrono::Utc;
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, StrokeKind, Vec2,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -124,6 +140,7 @@ pub struct DashboardApp {
     report_task: LlmTask,
     report_result: Option<String>,
     obsidian_task: ObsidianTask,
+    merge_task: MergeTask,
     report_markdown_cache: egui_commonmark::CommonMarkCache,
     /// The inference the user most recently opened from the Report list.
     /// Persists across navigation so returning from the 51Folds outcome
@@ -227,6 +244,11 @@ pub struct DashboardApp {
     /// Cached models for the currently-open theme, already sorted
     /// per `theme_list_sort`.
     cached_theme_models: Vec<FoldsModelRecord>,
+    /// Subset of cached model_ids that have an Obsidian vault export on
+    /// disk. Used to paint a "vault" indicator on each row so the user
+    /// can see at a glance which models are merge-ready. Refreshed
+    /// alongside `cached_theme_models`.
+    cached_models_with_vault: HashSet<String>,
     /// The theme the user has picked (or just created) for the model
     /// about to be submitted. `None` means "fall back to Uncategorized."
     /// Cleared after `start_folds_create` consumes it.
@@ -684,6 +706,7 @@ impl DashboardApp {
             report_task: LlmTask::new(),
             report_result: None,
             obsidian_task: ObsidianTask::new(),
+            merge_task: MergeTask::new(),
             report_markdown_cache: egui_commonmark::CommonMarkCache::default(),
             last_selected_report_id: None,
             report_selection: HashSet::new(),
@@ -715,6 +738,7 @@ impl DashboardApp {
             theme_list_page: 0,
             theme_list_sort: ThemeListSort::default(),
             cached_theme_models: Vec::new(),
+            cached_models_with_vault: HashSet::new(),
             pending_theme: None,
             new_theme_draft: None,
             manage_themes_open: false,
@@ -2381,14 +2405,36 @@ latest close. Keep SECONDARY instruments as corroborative mentions only.\n",
         });
     }
 
+    /// Returns the model the user is currently *viewing* — either the
+    /// one they opened from the 51Folds registry (`viewed_task.model`)
+    /// or the active foreground build (`folds_task.model`). Browsing a
+    /// registry entry doesn't populate the foreground slot, so the
+    /// toolbar checks both.
+    fn currently_loaded_model(&self) -> Option<&fiftyone_folds::ModelResponse> {
+        self.viewed_task
+            .as_ref()
+            .and_then(|t| t.model.as_deref())
+            .or(self.folds_task.model.as_deref())
+    }
+
+    /// True when the loaded model came from the registry-viewer slot
+    /// (so a post-merge install should land back into `viewed_task`
+    /// rather than `folds_task`).
+    fn loaded_model_is_viewed(&self) -> bool {
+        self.viewed_task
+            .as_ref()
+            .and_then(|t| t.model.as_ref())
+            .is_some()
+    }
+
     /// Open a folder picker and kick off an Obsidian vault export of
     /// the currently loaded model. The export runs on a background
     /// thread and reports back via `obsidian_task`.
     fn start_obsidian_export(&mut self) {
         // Pre-flight — the button is only shown when a model is loaded,
         // but check anyway in case state shifts between click and dispatch.
-        let model = match self.folds_task.model.as_ref() {
-            Some(m) => (**m).clone(),
+        let model = match self.currently_loaded_model() {
+            Some(m) => m.clone(),
             None => {
                 self.obsidian_task.error =
                     Some("No model loaded — open a completed model first.".to_owned());
@@ -2406,13 +2452,142 @@ latest close. Keep SECONDARY instruments as corroborative mentions only.\n",
 
         let (tx, rx) = mpsc::channel();
         self.obsidian_task.start(rx);
+        let db_path = database_path();
+        let model_id = model.model_id.clone();
 
         thread::spawn(move || {
             let evt = match crate::obsidian::export_model(&model, &parent) {
-                Ok(path) => ObsidianEvent::Done(path),
+                Ok(path) => {
+                    crate::storage::set_folds_model_vault_path(&db_path, &model_id, &path);
+                    ObsidianEvent::Done(path)
+                }
                 Err(err) => ObsidianEvent::Failed(format!("{err:#}")),
             };
             let _ = tx.send(evt);
+        });
+    }
+
+    /// Open a folder picker and kick off the *diff* phase of a vault
+    /// merge. The user picks an existing Hedgehog-exported vault; we
+    /// read it on a background thread and surface a [`VaultDiff`] via
+    /// `merge_task`. The preview dialog (slice 5) then renders the
+    /// diff and routes the Apply click through [`Self::apply_folds_merge`].
+    fn start_folds_merge(&mut self) {
+        // Make sure a model is loaded — the apply path PATCHes against
+        // the currently-loaded model_id, so a merge without a viewer
+        // would have nothing to send to.
+        let model_id = match self.currently_loaded_model() {
+            Some(m) => m.model_id.clone(),
+            None => {
+                self.merge_task.error =
+                    Some("No model loaded — open a completed model first.".to_owned());
+                return;
+            }
+        };
+        let target_is_viewed = self.loaded_model_is_viewed();
+
+        // If the model has a previously-exported vault on record, default
+        // the folder picker there so the user doesn't have to remember
+        // where they put it. The picker still opens — they can override
+        // it (e.g. if the vault has moved) but won't usually need to.
+        let recorded_vault = self
+            .storage
+            .folds_model_vault_path(&model_id)
+            .ok()
+            .flatten();
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Choose the Obsidian vault to merge from");
+        if let Some(p) = recorded_vault.as_ref() {
+            if let Some(parent) = p.parent() {
+                dialog = dialog.set_directory(parent);
+            } else {
+                dialog = dialog.set_directory(p);
+            }
+        }
+        let vault = match dialog.pick_folder() {
+            Some(p) => p,
+            None => return, // cancelled — silent.
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.merge_task.start(rx, vault.clone());
+        self.merge_task.target_is_viewed = target_is_viewed;
+
+        thread::spawn(move || {
+            let evt = match crate::obsidian::merge::read_vault_diff(&vault) {
+                Ok(diff) => MergeEvent::DiffReady(diff),
+                Err(err) => MergeEvent::Failed(format!("{err:#}")),
+            };
+            let _ = tx.send(evt);
+        });
+    }
+
+    /// Apply the user's selected state changes from a prior `DiffReady`.
+    /// PATCHes the server, polls for re-inference, then runs a
+    /// selective re-export over the same vault. Both steps happen on
+    /// the same background thread; the UI surface is a `Merging…`
+    /// spinner driven by `merge_task.in_flight`.
+    fn apply_folds_merge(&mut self) {
+        let Some(diff) = self.merge_task.pending_diff.take() else {
+            self.merge_task.error =
+                Some("No pending merge to apply — re-open the preview.".to_owned());
+            return;
+        };
+        let api_key = self.api_keys.folds.trim().to_owned();
+        if api_key.is_empty() {
+            self.merge_task.error =
+                Some("Set the 51Folds API key in Settings before merging.".to_owned());
+            return;
+        }
+        let model_id = match self.currently_loaded_model() {
+            Some(m) => m.model_id.clone(),
+            None => {
+                self.merge_task.error =
+                    Some("No model loaded — open the matching model first.".to_owned());
+                return;
+            }
+        };
+        let vault = match self.merge_task.vault_path.clone() {
+            Some(v) => v,
+            None => {
+                self.merge_task.error =
+                    Some("Vault path is missing — re-open the preview.".to_owned());
+                return;
+            }
+        };
+
+        // Only the changes the user ticked are sent to the server.
+        let selected: BTreeSet<String> = self.merge_task.selected_changes.clone();
+        let applied_changes: Vec<crate::obsidian::merge::DriverStateChange> = diff
+            .driver_state_changes
+            .iter()
+            .filter(|c| selected.contains(&c.code))
+            .cloned()
+            .collect();
+        if applied_changes.is_empty() {
+            self.merge_task.error = Some(
+                "No driver state changes were selected — pick at least one row before applying."
+                    .to_owned(),
+            );
+            // Restore the diff so the user can re-open the dialog.
+            self.merge_task.pending_diff = Some(diff);
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.merge_task.start_apply(rx);
+        let diff_for_thread = diff;
+        let db_path = database_path();
+        thread::spawn(move || {
+            let event = apply_merge_blocking(
+                api_key,
+                model_id,
+                db_path,
+                vault,
+                diff_for_thread,
+                applied_changes,
+            );
+            let _ = tx.send(event);
         });
     }
 
@@ -4397,6 +4572,10 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         };
         apply_sort(&mut rows, self.theme_list_sort);
         self.cached_theme_models = rows;
+        self.cached_models_with_vault = self
+            .storage
+            .folds_models_with_vault()
+            .unwrap_or_default();
     }
 
     fn handle_theme_cards_action(&mut self, action: theme_cards::ThemeCardsAction) {
@@ -4443,9 +4622,24 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
     /// Navigates to the Outcome sub-view so the user immediately sees
     /// the model's probability bars.
     fn open_browser_model(&mut self, model_id: &str) {
-        let json = match self.storage.load_folds_response_by_model_id(model_id) {
-            Ok(Some(json)) => json,
-            Ok(None) => {
+        // If the model has an Obsidian vault on record, prefer the
+        // vault's `Data/model.json` (which the merge wrote with the
+        // post-server response) over the DB's `response_json`. The DB
+        // can lag behind merges if a merge happened before the
+        // write-back was wired, or if the user merged with a future
+        // version of Hedgehog that touched the vault but skipped the
+        // DB. The vault is the source of truth for any model that
+        // has one.
+        let vault_path = self
+            .storage
+            .folds_model_vault_path(model_id)
+            .ok()
+            .flatten();
+        let (model, previous_outcomes) = match self
+            .load_browser_model_payload(model_id, vault_path.as_deref())
+        {
+            Ok(payload) => payload,
+            Err(BrowserModelError::Pending) => {
                 self.set_status(
                     &format!(
                         "Model {model_id} has no stored response yet \u{2014} it may still be building."
@@ -4454,19 +4648,16 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                 );
                 return;
             }
-            Err(e) => {
+            Err(BrowserModelError::Storage(msg)) => {
                 self.set_status(
-                    &format!("Failed to load model {model_id}: {e}"),
+                    &format!("Failed to load model {model_id}: {msg}"),
                     StatusKind::Error,
                 );
                 return;
             }
-        };
-        let model: fiftyone_folds::ModelResponse = match serde_json::from_str(&json) {
-            Ok(m) => m,
-            Err(e) => {
+            Err(BrowserModelError::Malformed(msg)) => {
                 self.set_status(
-                    &format!("Stored response for model {model_id} is malformed: {e}"),
+                    &format!("Stored response for model {model_id} is malformed: {msg}"),
                     StatusKind::Error,
                 );
                 return;
@@ -4480,10 +4671,84 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
         let mut task = FoldsTask::new();
         task.model_id = Some(model_id.to_owned());
         task.model = Some(Box::new(model));
+        task.previous_outcomes = previous_outcomes;
         task.question = question;
         task.init_draft_drivers();
         self.viewed_task = Some(task);
         self.model_view = ModelView::Outcome;
+    }
+
+    /// Returns the full model + the optional pre-merge outcome list to
+    /// seed `previous_outcomes` with. The "previous" comes from the
+    /// second-most-recent vault snapshot (`v{N-1}.json`) — the
+    /// baseline that produced the *latest* merge.
+    fn load_browser_model_payload(
+        &self,
+        model_id: &str,
+        vault_path: Option<&std::path::Path>,
+    ) -> Result<BrowserModelPayload, BrowserModelError> {
+        // Vault-first path — only taken when the vault exists on disk
+        // *and* contains a Data/model.json we can deserialise.
+        if let Some(vault) = vault_path
+            && vault.exists()
+            && let Ok(bytes) = std::fs::read(vault.join("Data").join("model.json"))
+            && let Ok(model) = serde_json::from_slice::<fiftyone_folds::ModelResponse>(&bytes)
+            && model.model_id == model_id
+        {
+            let previous = self.load_prior_snapshot_outcomes(vault, &model);
+            return Ok((model, previous));
+        }
+
+        // Fallback — DB stored response.
+        let json = self
+            .storage
+            .load_folds_response_by_model_id(model_id)
+            .map_err(|e| BrowserModelError::Storage(format!("{e}")))?
+            .ok_or(BrowserModelError::Pending)?;
+        let model: fiftyone_folds::ModelResponse =
+            serde_json::from_str(&json).map_err(|e| BrowserModelError::Malformed(format!("{e}")))?;
+        Ok((model, None))
+    }
+
+    /// Reads `v{N-1}.json` from `vault/Data/snapshots/` and returns
+    /// outcomes as `(label, probability)` pairs that match the labels
+    /// in `current_model`. The Outcome view's delta-annotation matches
+    /// on labels, so we need to align the previous outcome ids to the
+    /// labels the current model uses.
+    fn load_prior_snapshot_outcomes(
+        &self,
+        vault: &std::path::Path,
+        current_model: &fiftyone_folds::ModelResponse,
+    ) -> Option<Vec<(String, f64)>> {
+        let dir = vault.join("Data").join("snapshots");
+        let mut versions: Vec<u32> = std::fs::read_dir(&dir)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_str()?;
+                let stem = name.strip_suffix(".json")?;
+                let digits = stem.strip_prefix('v')?;
+                digits.parse::<u32>().ok()
+            })
+            .collect();
+        if versions.len() < 2 {
+            return None;
+        }
+        versions.sort();
+        let prior_v = versions[versions.len() - 2];
+        let bytes = std::fs::read(dir.join(format!("v{prior_v:03}.json"))).ok()?;
+        let snap: crate::obsidian::snapshot::Snapshot =
+            serde_json::from_slice(&bytes).ok()?;
+        let by_id: std::collections::HashMap<i64, f64> = snap.outcome_probabilities.into_iter().collect();
+        Some(
+            current_model
+                .current
+                .outcomes
+                .iter()
+                .filter_map(|o| by_id.get(&o.id).map(|p| (o.label.clone(), *p)))
+                .collect(),
+        )
     }
 
     fn render_central_model_view(&mut self, ui: &mut egui::Ui) {
@@ -4516,6 +4781,7 @@ outcomes for this hypothesis. The statement and context stay unchanged.",
                     &theme,
                     &self.cached_theme_models,
                     foreground_id.as_deref(),
+                    &self.cached_models_with_vault,
                     self.theme_list_sort,
                     self.theme_list_page,
                 );
@@ -6253,6 +6519,52 @@ impl eframe::App for DashboardApp {
         self.poll_folds();
         self.poll_research_terminal();
         self.obsidian_task.poll();
+        self.merge_task.poll();
+        // Install the post-merge model the moment it arrives so the
+        // outcome view, sidebar badges, and re-eval baseline all reflect
+        // the freshly-merged probabilities without a manual refresh.
+        // Route to the slot the merge originated from — viewing a
+        // registry entry shouldn't quietly overwrite an in-flight
+        // foreground build.
+        if let Some(new_model) = self.merge_task.completed_model.take() {
+            // Capture the *pre*-merge outcome probabilities into the
+            // target task's `previous_outcomes` so the existing
+            // delta-annotation in the Outcome view ("↑ up from X%")
+            // lights up the same way it does after Re-evaluate. Mirrors
+            // 51Folds's own "(Previously: X%)" affordance.
+            let snapshot_outcomes = |task: &tasks::FoldsTask| -> Vec<(String, f64)> {
+                task.model
+                    .as_ref()
+                    .map(|m| {
+                        m.current
+                            .outcomes
+                            .iter()
+                            .map(|o| (o.label.clone(), o.probability.unwrap_or(0.0)))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            if self.merge_task.target_is_viewed {
+                if let Some(vt) = self.viewed_task.as_mut() {
+                    vt.previous_outcomes = Some(snapshot_outcomes(vt));
+                    vt.model = Some(new_model);
+                    vt.init_draft_drivers();
+                } else {
+                    // The viewer was dismissed mid-merge; install into
+                    // the foreground rather than dropping the result.
+                    self.folds_task.previous_outcomes =
+                        Some(snapshot_outcomes(&self.folds_task));
+                    self.folds_task.model = Some(new_model);
+                    self.folds_task.init_draft_drivers();
+                }
+            } else {
+                self.folds_task.previous_outcomes = Some(snapshot_outcomes(&self.folds_task));
+                self.folds_task.model = Some(new_model);
+                self.folds_task.init_draft_drivers();
+            }
+            self.central_view = CentralView::Model;
+            self.model_view = ModelView::Outcome;
+        }
         if self.folds_task.in_flight {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -6386,6 +6698,27 @@ impl eframe::App for DashboardApp {
             }
         }
 
+        // -- Merge from Vault preview dialog --
+        // Shown whenever the diff phase has returned a VaultDiff and the
+        // user hasn't yet cancelled or applied. The dialog mutates
+        // `selected_changes` directly via the &mut borrow.
+        let pending = self.merge_task.pending_diff.clone();
+        if let Some(diff) = pending {
+            let (cancel, apply) = dialogs::render_merge_preview_dialog(
+                ctx,
+                &diff,
+                &mut self.merge_task.selected_changes,
+            );
+            if cancel {
+                self.merge_task.cancel();
+            }
+            if apply {
+                // `pending_diff` is taken inside apply_folds_merge so the
+                // dialog stops rendering immediately on click.
+                self.apply_folds_merge();
+            }
+        }
+
         // Help now renders as a central panel view; no dialog window.
     }
 }
@@ -6492,6 +6825,7 @@ impl DashboardApp {
 
                 // Model navigation (only when 51Folds tab is active)
                 let mut trigger_obsidian = false;
+                let mut trigger_merge = false;
                 if self.central_view == CentralView::Model {
                     // Themes pill — always returns to the cards landing.
                     if ui
@@ -6549,7 +6883,11 @@ impl DashboardApp {
                     // model is loaded; status surfaces inline so the user
                     // sees the result without leaving this row.
                     ui.separator();
-                    let model_loaded = self.folds_task.model.is_some();
+                    // "Loaded" covers both the foreground build slot and
+                    // a model opened via the 51Folds registry — the
+                    // toolbar lives outside `render_central_model_view`,
+                    // so we can't lean on its swap trick.
+                    let model_loaded = self.currently_loaded_model().is_some();
                     let btn_label = if self.obsidian_task.in_flight {
                         "Exporting…"
                     } else {
@@ -6564,7 +6902,27 @@ impl DashboardApp {
                     }
                     if self.obsidian_task.in_flight {
                         ui.spinner();
-                    } else if let Some(path) = self.obsidian_task.last_exported.clone() {
+                    } else if let Some(path) = self
+                        .obsidian_task
+                        .last_exported
+                        .clone()
+                        .or_else(|| {
+                            // Fall back to the path persisted on the
+                            // model's row in `folds_models` so the
+                            // Open / Reveal affordances survive an
+                            // app restart. The DB row was written
+                            // either at first export or after any
+                            // selective re-export from merge.
+                            let model_id = self
+                                .currently_loaded_model()
+                                .map(|m| m.model_id.clone())?;
+                            self.storage
+                                .folds_model_vault_path(&model_id)
+                                .ok()
+                                .flatten()
+                                .filter(|p| p.exists())
+                        })
+                    {
                         if ui
                             .small_button("Open in Obsidian")
                             .on_hover_text(path.display().to_string())
@@ -6586,9 +6944,48 @@ impl DashboardApp {
                                 .color(Color32::from_rgb(220, 120, 120)),
                         );
                     }
+
+                    // Merge from Vault — companion to Export to Obsidian.
+                    // Same enablement gate as Export plus "no merge in
+                    // flight" so a click doesn't spawn a second background
+                    // thread on top of an in-progress one.
+                    let merge_label = if self.merge_task.in_flight {
+                        if self.merge_task.applying {
+                            "Merging…"
+                        } else {
+                            "Reading vault…"
+                        }
+                    } else {
+                        "Merge from Vault"
+                    };
+                    let merge_resp = ui.add_enabled(
+                        model_loaded && !self.merge_task.in_flight,
+                        egui::Button::new(merge_label),
+                    );
+                    if merge_resp.clicked() {
+                        trigger_merge = true;
+                    }
+                    if self.merge_task.in_flight {
+                        ui.spinner();
+                    } else if let Some(summary) = self.merge_task.last_applied.clone() {
+                        ui.label(
+                            RichText::new(format!("✓ {summary}"))
+                                .size(12.0)
+                                .color(Color32::from_rgb(120, 200, 140)),
+                        );
+                    } else if let Some(err) = self.merge_task.error.clone() {
+                        ui.label(
+                            RichText::new(format!("✗ {err}"))
+                                .size(12.0)
+                                .color(Color32::from_rgb(220, 120, 120)),
+                        );
+                    }
                 }
                 if trigger_obsidian {
                     self.start_obsidian_export();
+                }
+                if trigger_merge {
+                    self.start_folds_merge();
                 }
 
                 // Report — always available (covers both AI and Research analyses)

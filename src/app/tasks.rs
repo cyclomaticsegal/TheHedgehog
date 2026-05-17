@@ -12,7 +12,9 @@
 //! `FoldsTask` + `FoldsBacklog`.
 use crate::folds::FoldsResult;
 use crate::models::{AiEvent, AiInferenceResult};
-use std::collections::HashMap;
+use crate::obsidian::merge::VaultDiff;
+use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 // ---------------------------------------------------------------------------
@@ -697,6 +699,173 @@ impl ObsidianTask {
             Err(TryRecvError::Disconnected) => {
                 self.in_flight = false;
                 self.error = Some("Obsidian export thread disconnected unexpectedly.".to_owned());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Obsidian merge task — diff-then-apply round-trip from a vault.
+// ---------------------------------------------------------------------------
+
+/// Events flowing from the merge background threads back to the UI loop.
+///
+/// There are two phases that share this enum: the diff phase (vault is
+/// read, no server call yet) emits `DiffReady` or `Failed`; the apply
+/// phase (server PATCH + selective re-export) emits `Applied` or
+/// `Failed`. The `MergeTask` holds enough state to know which phase any
+/// arriving event belongs to.
+pub(super) enum MergeEvent {
+    DiffReady(VaultDiff),
+    Applied {
+        new_model: Box<fiftyone_folds::ModelResponse>,
+        version: u32,
+        applied_state_changes: usize,
+        parked_total: usize,
+    },
+    Failed(String),
+}
+
+pub(super) struct MergeTask {
+    pub(super) in_flight: bool,
+    pub(super) rx: Option<Receiver<MergeEvent>>,
+    pub(super) error: Option<String>,
+    /// Diff produced by the most recent read. The preview dialog renders
+    /// from this. Cleared on cancel, on Apply (the apply path takes
+    /// ownership), and on subsequent diff reads.
+    pub(super) pending_diff: Option<VaultDiff>,
+    /// Driver codes the user has ticked for inclusion in the PATCH. We
+    /// initialise this to "all changes selected" when a diff arrives —
+    /// most of the time the user will accept the lot.
+    pub(super) selected_changes: BTreeSet<String>,
+    /// Vault path the most recent read was against; reused on Apply so
+    /// the selective re-export lands back at the same path.
+    pub(super) vault_path: Option<PathBuf>,
+    /// One-line summary of the last successful merge, shown as a toast
+    /// until the user acknowledges it or kicks off another merge.
+    pub(super) last_applied: Option<String>,
+    /// Post-merge model handed up by the apply thread, waiting for the
+    /// dashboard's update loop to install it into the right slot.
+    /// `MergeTask::poll` can't update `FoldsTask` directly without
+    /// taking a lock on `DashboardApp`; the dashboard drains this on
+    /// each tick instead.
+    pub(super) completed_model: Option<Box<fiftyone_folds::ModelResponse>>,
+    /// True when the merge was initiated against a model loaded via
+    /// the 51Folds registry (`viewed_task.model`) rather than the
+    /// foreground build. The dashboard uses this on install so the
+    /// updated probabilities land back in the same viewer the user
+    /// was looking at.
+    pub(super) target_is_viewed: bool,
+    /// True while the apply phase (PATCH + selective re-export) is
+    /// running on the background thread. Lets the toolbar
+    /// differentiate `Reading vault…` (diff phase) from `Merging…`
+    /// (apply phase) — both have `in_flight == true` but `pending_diff`
+    /// has been taken by the time apply starts, so the diff alone
+    /// can't disambiguate.
+    pub(super) applying: bool,
+}
+
+impl MergeTask {
+    pub(super) fn new() -> Self {
+        Self {
+            in_flight: false,
+            rx: None,
+            error: None,
+            pending_diff: None,
+            selected_changes: BTreeSet::new(),
+            vault_path: None,
+            last_applied: None,
+            completed_model: None,
+            target_is_viewed: false,
+            applying: false,
+        }
+    }
+
+    pub(super) fn start(&mut self, rx: Receiver<MergeEvent>, vault_path: PathBuf) {
+        self.in_flight = true;
+        self.applying = false;
+        self.rx = Some(rx);
+        self.error = None;
+        self.pending_diff = None;
+        self.selected_changes.clear();
+        self.vault_path = Some(vault_path);
+        self.last_applied = None;
+    }
+
+    /// Re-enter the in-flight state for the apply phase. Keeps the
+    /// vault_path so the re-export lands at the right place.
+    pub(super) fn start_apply(&mut self, rx: Receiver<MergeEvent>) {
+        self.in_flight = true;
+        self.applying = true;
+        self.rx = Some(rx);
+        self.error = None;
+        // `pending_diff` is cleared by the caller once the apply request
+        // is sent — we don't want stale diff state hanging around if the
+        // PATCH succeeds.
+    }
+
+    /// User cancelled the preview dialog without applying. Clears
+    /// pending state but keeps `last_applied` so a prior success toast
+    /// stays visible.
+    pub(super) fn cancel(&mut self) {
+        self.pending_diff = None;
+        self.selected_changes.clear();
+        // Note: we do NOT clear vault_path. Keeping it means a follow-up
+        // "Merge from Vault" click can default-pick the same vault.
+    }
+
+    pub(super) fn poll(&mut self) {
+        if !self.in_flight {
+            return;
+        }
+        let Some(rx) = self.rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(MergeEvent::DiffReady(diff)) => {
+                self.in_flight = false;
+                self.applying = false;
+                self.selected_changes = diff
+                    .driver_state_changes
+                    .iter()
+                    .map(|c| c.code.clone())
+                    .collect();
+                self.pending_diff = Some(diff);
+            }
+            Ok(MergeEvent::Applied {
+                new_model,
+                version,
+                applied_state_changes,
+                parked_total,
+            }) => {
+                self.in_flight = false;
+                self.applying = false;
+                self.pending_diff = None;
+                self.selected_changes.clear();
+                self.completed_model = Some(new_model);
+                let parked_note = if parked_total == 0 {
+                    String::new()
+                } else {
+                    format!(" · {parked_total} parked")
+                };
+                self.last_applied = Some(format!(
+                    "Merged v{version:03} — {applied_state_changes} applied{parked_note}"
+                ));
+            }
+            Ok(MergeEvent::Failed(err)) => {
+                self.in_flight = false;
+                self.applying = false;
+                self.pending_diff = None;
+                self.error = Some(err);
+            }
+            Err(TryRecvError::Empty) => {
+                self.rx = Some(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.in_flight = false;
+                self.applying = false;
+                self.error =
+                    Some("Merge background thread disconnected unexpectedly.".to_owned());
             }
         }
     }

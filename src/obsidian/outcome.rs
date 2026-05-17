@@ -3,15 +3,26 @@
 //! directly to `DV` (and thus most directly shape this outcome), and a
 //! Mermaid funnel back to those drivers.
 
-use crate::obsidian::{mermaid, names::Names};
+use crate::obsidian::{WriteMode, history, mermaid, names::Names};
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// H2 headings emitted by this writer. Anything *not* in this set is
+/// treated as user-authored and preserved across selective re-exports.
+const KNOWN_MODEL_HEADINGS: &[&str] = &[
+    "Direct Drivers",
+    "Causal Path",
+    "History",
+    "In The Model",
+];
+
 pub(crate) fn write_all(
     model: &fiftyone_folds::ModelResponse,
     names: &Names,
+    hist: &history::History,
     root: &Path,
+    mode: WriteMode,
 ) -> Result<()> {
     std::fs::create_dir_all(root.join("Outcomes"))?;
 
@@ -23,10 +34,39 @@ pub(crate) fn write_all(
 
     for o in &model.current.outcomes {
         let path = root.join(names.outcomes.get(&o.id).expect("outcome name precomputed"));
-        let body = render_outcome(o, top_id == Some(o.id), &dv_parents, &by_code, names);
-        std::fs::write(&path, body)?;
+        let history_rows = hist.outcomes.get(&o.id).map(Vec::as_slice).unwrap_or(&[]);
+        let body = render_outcome(
+            o,
+            top_id == Some(o.id),
+            &dv_parents,
+            &by_code,
+            names,
+            history_rows,
+        );
+        let final_body = match mode {
+            WriteMode::Fresh => body,
+            WriteMode::Selective => merge_user_zones(&path, body)?,
+        };
+        std::fs::write(&path, final_body)?;
     }
     Ok(())
+}
+
+fn merge_user_zones(path: &Path, fresh_model_body: String) -> Result<String> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return Ok(fresh_model_body);
+    };
+    let preserved = history::extract_user_zones(&existing, KNOWN_MODEL_HEADINGS);
+    if preserved.trim().is_empty() {
+        return Ok(fresh_model_body);
+    }
+    let mut out = fresh_model_body;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&preserved);
+    Ok(out)
 }
 
 fn dv_parents(model: &fiftyone_folds::ModelResponse) -> Vec<String> {
@@ -61,6 +101,7 @@ fn render_outcome(
     dv_parents: &[String],
     by_code: &BTreeMap<&str, &fiftyone_folds::Driver>,
     names: &Names,
+    history_rows: &[history::OutcomeHistoryRow],
 ) -> String {
     let pct = o.probability.unwrap_or(0.0) * 100.0;
     let mut s = String::new();
@@ -104,6 +145,7 @@ fn render_outcome(
         s.push('\n');
     }
 
+    s.push_str(&history::render_outcome_section(history_rows));
     s.push_str(
         "## In The Model\n\nReturn to the model [[Overview]] or the [[Model.canvas|causal map]].\n",
     );
