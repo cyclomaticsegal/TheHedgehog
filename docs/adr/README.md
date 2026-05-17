@@ -53,3 +53,5 @@ Each ADR contains:
 | [0021](0021-instrument-set-reduction-bitcoin-into-monetary.md) | Instrument Set Reduction — Bitcoin Folded into Monetary | Accepted | 2026-04-16 |
 | [0022](0022-primary-secondary-tertiary-prompt-framework.md) | Primary / Secondary / Tertiary Prompt Framework | Accepted | 2026-04-16 |
 | [0023](0023-51folds-refresh-retry-server-status.md) | 51Folds Refresh — Server-Confirmed Failure Detection and Retry | Accepted | 2026-04-17 |
+| [0024](0024-51folds-tab-browser-landing-and-context-aware-sidebar.md) | 51Folds Tab as Model Registry — Browser Landing, Context-Aware Sidebar | Accepted | 2026-05-14 |
+| [0025](0025-obsidian-merge-roundtrip-smoke-test.md) | Obsidian Round-Trip Merge Smoke Test — Vault as Bayesian Co-Editor | Accepted | 2026-05-15 |

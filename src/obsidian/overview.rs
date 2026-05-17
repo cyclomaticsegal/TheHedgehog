@@ -3,21 +3,60 @@
 //! outcome probabilities, and entry points to the drivers / canvas /
 //! sources.
 
-use crate::obsidian::{mermaid, names::Names};
+use crate::obsidian::{WriteMode, history, mermaid, names::Names};
 use anyhow::Result;
 use std::path::Path;
+
+/// H2 headings emitted by this writer. Anything else in `Overview.md`
+/// is user-authored and preserved across selective re-exports.
+const KNOWN_MODEL_HEADINGS: &[&str] = &[
+    "Background",
+    "Outcomes",
+    "Drivers",
+    "Causal Map",
+    "Sources",
+    "History",
+];
 
 pub(crate) fn write(
     model: &fiftyone_folds::ModelResponse,
     names: &Names,
+    hist: &history::History,
     root: &Path,
+    mode: WriteMode,
 ) -> Result<()> {
-    let body = render(model, names);
-    std::fs::write(root.join("Overview.md"), body)?;
+    let body = render(model, names, hist);
+    let path = root.join("Overview.md");
+    let final_body = match mode {
+        WriteMode::Fresh => body,
+        WriteMode::Selective => merge_user_zones(&path, body)?,
+    };
+    std::fs::write(&path, final_body)?;
     Ok(())
 }
 
-fn render(model: &fiftyone_folds::ModelResponse, names: &Names) -> String {
+fn merge_user_zones(path: &Path, fresh_model_body: String) -> Result<String> {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return Ok(fresh_model_body);
+    };
+    let preserved = history::extract_user_zones(&existing, KNOWN_MODEL_HEADINGS);
+    if preserved.trim().is_empty() {
+        return Ok(fresh_model_body);
+    }
+    let mut out = fresh_model_body;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&preserved);
+    Ok(out)
+}
+
+fn render(
+    model: &fiftyone_folds::ModelResponse,
+    names: &Names,
+    hist: &history::History,
+) -> String {
     let mut s = String::new();
 
     s.push_str("---\n");
@@ -96,6 +135,9 @@ fn render(model: &fiftyone_folds::ModelResponse, names: &Names) -> String {
             if names.sources.len() == 1 { "" } else { "s" }
         ));
     }
+    s.push('\n');
+
+    s.push_str(&history::render_overview_section(&hist.merges));
 
     s
 }

@@ -4,8 +4,8 @@ use crate::models::{
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
-use rusqlite::{Connection, params};
-use std::path::Path;
+use rusqlite::{Connection, OptionalExtension, params};
+use std::path::{Path, PathBuf};
 
 pub struct Storage {
     conn: Connection,
@@ -154,6 +154,14 @@ impl Storage {
              "ALTER TABLE folds_models ADD COLUMN outcomes TEXT"),
             ("short_summary",
              "ALTER TABLE folds_models ADD COLUMN short_summary TEXT"),
+            // Absolute path of the most-recent Obsidian vault export for
+            // this model, if any. Used by the Merge-from-Vault flow to
+            // default the folder picker and to badge the model in the
+            // registry as "has a vault".
+            ("obsidian_vault_path",
+             "ALTER TABLE folds_models ADD COLUMN obsidian_vault_path TEXT"),
+            ("obsidian_vault_exported_at",
+             "ALTER TABLE folds_models ADD COLUMN obsidian_vault_exported_at TEXT"),
         ];
         for (col, sql) in folds_migrations {
             if !folds_cols.contains(*col) {
@@ -932,6 +940,75 @@ pub fn update_folds_model_completed_standalone(
     );
     if let Err(e) = result {
         eprintln!("warn: folds completed update failed for {model_id}: {e:#}");
+    }
+}
+
+/// Record that a model has been exported as an Obsidian vault at
+/// `vault_path`. Idempotent — subsequent exports overwrite the row.
+/// Called from `start_obsidian_export` after the background thread
+/// reports a successful write.
+pub fn set_folds_model_vault_path(
+    db_path: &Path,
+    model_id: &str,
+    vault_path: &Path,
+) {
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("warn: vault path persist could not open db: {e:#}");
+            return;
+        }
+    };
+    let result = conn.execute(
+        r#"UPDATE folds_models
+           SET obsidian_vault_path = ?1,
+               obsidian_vault_exported_at = ?2
+           WHERE model_id = ?3"#,
+        params![
+            vault_path.to_string_lossy(),
+            Utc::now().to_rfc3339(),
+            model_id,
+        ],
+    );
+    if let Err(e) = result {
+        eprintln!("warn: vault path persist failed for {model_id}: {e:#}");
+    }
+}
+
+impl Storage {
+    /// Look up the most-recent vault export path for a model. Returns
+    /// `None` if the model has never been exported, or if the row is
+    /// missing the column (pre-migration DBs return NULL).
+    pub fn folds_model_vault_path(&self, model_id: &str) -> Result<Option<PathBuf>> {
+        let row: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT obsidian_vault_path FROM folds_models
+                 WHERE model_id = ?1 AND obsidian_vault_path IS NOT NULL",
+                params![model_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(row.map(PathBuf::from))
+    }
+
+    /// Set of model_ids that have a recorded Obsidian vault export.
+    /// Used by the registry rendering to badge "has a vault" entries
+    /// without N+1 lookups.
+    pub fn folds_models_with_vault(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT model_id FROM folds_models
+                 WHERE obsidian_vault_path IS NOT NULL",
+            )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
     }
 }
 

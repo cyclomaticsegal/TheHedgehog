@@ -8,6 +8,7 @@ use super::theme::*;
 use super::views::ThemeListSort;
 use crate::models::{FoldsModelRecord, FoldsTheme};
 use eframe::egui::{self, Color32, RichText};
+use std::collections::HashSet;
 
 const PAGE_SIZE: usize = 10;
 
@@ -25,6 +26,7 @@ pub(super) fn render_theme_list(
     theme: &FoldsTheme,
     rows: &[FoldsModelRecord],
     foreground_model_id: Option<&str>,
+    models_with_vault: &HashSet<String>,
     sort: ThemeListSort,
     page: usize,
 ) -> ThemeListAction {
@@ -125,7 +127,8 @@ pub(super) fn render_theme_list(
         .show(ui, |ui| {
             for record in page_slice {
                 let is_foreground = foreground_model_id == Some(record.model_id.as_str());
-                if render_row(ui, record, is_foreground, 56.0) {
+                let has_vault = models_with_vault.contains(&record.model_id);
+                if render_row(ui, record, is_foreground, has_vault, 56.0) {
                     action = ThemeListAction::OpenModel(record.model_id.clone());
                 }
             }

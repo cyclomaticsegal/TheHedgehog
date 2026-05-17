@@ -249,3 +249,65 @@ pub(super) fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<
         Ok(())
     }
 }
+
+/// Run the apply phase of an Obsidian-vault merge on the calling thread.
+///
+/// PATCHes the user's selected driver state changes through the SDK
+/// (blocking until re-inference completes), builds a `MergeAudit` from
+/// the post-server `ModelResponse`, then runs `re_export_with_merge`
+/// over the same vault path. Returns the `MergeEvent` the caller should
+/// post back on the `MergeTask` channel.
+///
+/// Lives in `util.rs` rather than `app.rs` so the heavy thread-body
+/// logic stays out of the dashboard struct.
+pub(super) fn apply_merge_blocking(
+    api_key: String,
+    model_id: String,
+    db_path: std::path::PathBuf,
+    vault: std::path::PathBuf,
+    diff: crate::obsidian::merge::VaultDiff,
+    applied_changes: Vec<crate::obsidian::merge::DriverStateChange>,
+) -> super::tasks::MergeEvent {
+    use super::tasks::MergeEvent;
+
+    let drivers: Vec<fiftyone_folds::DriverStateInput> = applied_changes
+        .iter()
+        .map(|c| fiftyone_folds::DriverStateInput {
+            code: c.code.clone(),
+            state: c.new_state.clone(),
+        })
+        .collect();
+
+    let new_model = match crate::folds::merge_drivers(&api_key, &model_id, drivers) {
+        Ok(m) => m,
+        Err(msg) => return MergeEvent::Failed(msg),
+    };
+
+    // Persist the post-merge response to `folds_models.response_json`
+    // so that re-opening this model from the registry (which reads
+    // straight from that column) reflects the merged state instead of
+    // silently reverting to the pre-merge build response.
+    crate::folds::persist_completed(&db_path, &model_id, &new_model);
+
+    let audit = match crate::obsidian::merge::build_audit_from(&diff, &applied_changes, &new_model)
+    {
+        Ok(a) => a,
+        Err(e) => return MergeEvent::Failed(format!("Building merge audit: {e:#}")),
+    };
+    let version = audit.version;
+    let applied_state_changes = audit.driver_state_changes.len();
+    let parked_total = audit.parked_note_additions
+        + audit.parked_metadata_changes
+        + audit.parked_edge_changes;
+
+    if let Err(e) = crate::obsidian::re_export_with_merge(&new_model, &vault, audit) {
+        return MergeEvent::Failed(format!("Writing merged vault: {e:#}"));
+    }
+
+    MergeEvent::Applied {
+        new_model: Box::new(new_model),
+        version,
+        applied_state_changes,
+        parked_total,
+    }
+}

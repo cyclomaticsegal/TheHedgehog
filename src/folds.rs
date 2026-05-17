@@ -696,7 +696,12 @@ fn persist_theme_assignment(db_path: &PathBuf, model_id: &str, theme_id: Option<
     }
 }
 
-fn persist_completed(db_path: &std::path::Path, model_id: &str, model: &ModelResponse) {
+/// Persist the model response to `folds_models.response_json` (plus
+/// denormalised outcomes / short_summary). Same write the initial-build
+/// flow uses; also called by the merge apply path so that re-opening
+/// the model from the registry post-merge picks up the merged response
+/// instead of falling back to the stored pre-merge build.
+pub fn persist_completed(db_path: &std::path::Path, model_id: &str, model: &ModelResponse) {
     let response_json = serde_json::to_string(model).unwrap_or_default();
     let outcomes_json = serde_json::to_string(
         &model
@@ -715,4 +720,54 @@ fn persist_completed(db_path: &std::path::Path, model_id: &str, model: &ModelRes
         &outcomes_json,
         &model.short_summary,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Merge-from-vault wrapper — synchronous PATCH + wait, returns the model
+// ---------------------------------------------------------------------------
+
+/// Same wire behaviour as [`patch_drivers`] but returns the post-PATCH
+/// model directly instead of writing it to an mpsc channel. Used by the
+/// vault-merge orchestration which sequences PATCH → selective re-export
+/// on the same background thread.
+///
+/// Naming is deliberate: this is the same `patch_drivers` SDK call as the
+/// Re-evaluate button. We call it `merge_drivers` here so the merge call
+/// site reads cleanly ("merge the drivers the user changed in the vault")
+/// without exposing what is, on the wire, just another PATCH.
+pub fn merge_drivers(
+    api_key: &str,
+    model_id: &str,
+    drivers: Vec<fiftyone_folds::DriverStateInput>,
+) -> Result<ModelResponse, String> {
+    let rt = build_runtime();
+    rt.block_on(async {
+        let client = build_client(api_key).map_err(|e| format!("{e}"))?;
+        client
+            .models()
+            .patch_drivers(model_id, &drivers)
+            .await
+            .map_err(|e| format!("{e}"))?;
+        let poll_config = PollConfig {
+            interval: Duration::from_secs(2),
+            timeout: Duration::from_secs(60),
+        };
+        match client
+            .models()
+            .wait_until_complete(model_id, Some(poll_config))
+            .await
+        {
+            Ok(model) => {
+                if model.current.outcomes.is_empty() || model.drivers.is_empty() {
+                    Err("51Folds returned an incomplete model after merge.".to_owned())
+                } else {
+                    Ok(model)
+                }
+            }
+            Err(FoldsError::PollTimeout { message }) => {
+                Err(format!("Merge timed out: {message}"))
+            }
+            Err(e) => Err(format!("Merge failed while waiting for result: {e}")),
+        }
+    })
 }
