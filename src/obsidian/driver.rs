@@ -325,8 +325,14 @@ fn rewrite_citations(
     sources: &SourceIndex,
     used: &mut HashSet<String>,
 ) -> String {
+    // Byte-level scan is fine because every branching character (`[`, `]`,
+    // digits, `,`, `\n`) is ASCII, and UTF-8 continuation bytes are all
+    // ≥ 0x80 — so they can't accidentally match an ASCII delimiter. We
+    // accumulate into `Vec<u8>` rather than `String` so multi-byte
+    // sequences pass through unmodified instead of getting split into
+    // individual Latin-1 codepoints.
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out: Vec<u8> = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'['
@@ -353,16 +359,16 @@ fn rewrite_citations(
                     }
                 }
                 if any_known {
-                    out.push_str(&rendered);
+                    out.extend_from_slice(rendered.as_bytes());
                     i = end + 1;
                     continue;
                 }
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("UTF-8 in → UTF-8 out (only ASCII branch points)")
 }
 
 fn find_close_bracket(bytes: &[u8], open: usize) -> Option<usize> {
