@@ -241,6 +241,35 @@ mod e2e_tests {
         p
     }
 
+    /// Regression for <https://github.com/cyclomaticsegal/TheHedgehog/issues/16>:
+    /// `rewrite_citations` used to cast each byte of the justification text
+    /// to `char` individually, splitting multi-byte UTF-8 sequences into
+    /// Latin-1 codepoints. EDANR's Medium justification ("projected €800
+    /// billion by 2030") was the canary — the `€` (E2 82 AC) rendered as
+    /// `â¬`. Discovered by FoldBrowser's cross-tool parity test.
+    #[test]
+    fn rich_fixture_preserves_euro_sign_in_edanr_justification() {
+        let model = load_rich_fixture();
+        let parent = tempdir();
+        let vault = export_model(&model, &parent).expect("export succeeds");
+
+        let edanr = std::fs::read_to_string(
+            vault.join("Drivers/EDANR — European Defense Autonomy and NATO Relevance.md"),
+        )
+        .expect("EDANR driver file present");
+        assert!(
+            edanr.contains("€800 billion"),
+            "EDANR justification should contain '€800 billion' (UTF-8 E2 82 AC); \
+             got mojibake instead. See issue #16."
+        );
+        assert!(
+            !edanr.contains("â¬800 billion"),
+            "EDANR justification still contains 'â¬' mojibake — bug not fixed."
+        );
+
+        std::fs::remove_dir_all(parent).ok();
+    }
+
     #[test]
     fn rich_fixture_writes_complete_vault() {
         let model = load_rich_fixture();
